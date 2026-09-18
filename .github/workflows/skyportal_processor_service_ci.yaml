@@ -1,0 +1,261 @@
+name: SkyPortal Processor Service CI/CD
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+env:
+  OWNCLOUD_BASE_URL: "http://localhost:8080/remote.php/dav/files"
+  OWNCLOUD_USERNAME: "admin"
+  OWNCLOUD_TOKEN: "admin"
+  OWNCLOUD_USER_ID: "admin"
+
+  SAVE_PATH: "Candidates/Skyportal"
+  STDWEB_SAVE_PATH: ""
+  POLL_INTERVAL: "10"
+  GROUP_IDS: "1,2,3"
+  SOURCE_TAG: ""
+  SKYPORTAL_COMMAND: "@rescan"
+  # "TAROT Calern" is one of the fixed demo instruments make load_demo_data
+  # seeds every time -- matches the TAROT-TCA folder the integration test
+  # uploads its fixture FITS under.
+  TELESCOPE_INSTRUMENT_MAP: '{"TAROT-TCA": "TAROT Calern"}'
+  START_TIME: "2017-06-01T00:00:00Z"
+
+  # Checked out and built alongside grandma_tools; see the "Checkout StdWeb" step.
+  # NOTE: this ref must exist and be pushed to vlad2305m/stdweb for the workflow
+  # to resolve it -- see the repo's session notes if it 404s.
+  STDWEB_REF: "fix/stacking_task_path"
+  STDWEB_USERNAME: "stdweb-ci"
+  STDWEB_PASSWORD: "stdweb-ci-password-not-used-in-prod"
+
+jobs:
+  integration-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Checkout SkyPortal
+      uses: actions/checkout@v4
+      with:
+        repository: skyportal/skyportal
+        path: skyportal
+        submodules: recursive
+
+    - name: Checkout StdWeb
+      uses: actions/checkout@v4
+      with:
+        repository: vlad2305m/stdweb
+        ref: ${{ env.STDWEB_REF }}
+        path: stdweb
+        submodules: recursive
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build SkyPortal Docker images
+      run: |
+        cd skyportal
+        echo "Building SkyPortal Docker images..."
+        make docker-local
+        echo "SkyPortal images built successfully"
+
+    - name: Start all services
+      env:
+        STDWEB_PATH: ../stdweb
+      run: |
+        cd skyportal_processor_service
+        echo "Starting services..."
+        docker compose up -d --build
+
+    - name: Wait for StdWeb to be ready
+      run: |
+        echo "Waiting for StdWeb (redis+migrate+celery+runserver) to come up..."
+        timeout 120 bash -c 'until curl -sf http://localhost:8000/login/ > /dev/null; do sleep 2; done'
+        echo "StdWeb is up"
+
+    - name: Create StdWeb superuser and API token
+      id: extract_stdweb_token
+      run: |
+        echo "Creating StdWeb superuser..."
+        docker exec stdweb-web python manage.py shell -c "
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        if not User.objects.filter(username='${{ env.STDWEB_USERNAME }}').exists():
+            User.objects.create_superuser('${{ env.STDWEB_USERNAME }}', 'ci@example.com', '${{ env.STDWEB_PASSWORD }}')
+        "
+
+        echo "Creating StdWeb API token..."
+        docker exec stdweb-web python manage.py drf_create_token ${{ env.STDWEB_USERNAME }} > token_output.txt
+        STDWEB_TOKEN=$(tail -1 token_output.txt | awk '{print $3}')
+
+        if [ -z "$STDWEB_TOKEN" ]; then
+          echo "Failed to extract StdWeb token"
+          cat token_output.txt
+          exit 1
+        fi
+
+        echo "STDWEB_TOKEN=$STDWEB_TOKEN" >> $GITHUB_OUTPUT
+
+    - name: Initialize SkyPortal database
+      run: |
+        cd skyportal
+        echo "Creating database tables..."
+        docker exec skyportal-web bash -c 'source /skyportal_env/bin/activate && FLAGS="--config=config.yaml" make db_create_tables'
+
+        echo "Loading demo data..."
+        docker exec skyportal-web bash -c 'source /skyportal_env/bin/activate && FLAGS="--create_tables --config=config.yaml" make load_demo_data'
+        echo "Database initialized successfully"
+
+    - name: Extract SkyPortal token
+      id: extract_skyportal_token
+      run: |
+        cd skyportal
+        echo "Extracting SkyPortal token..."
+        SKYPORTAL_TOKEN=$(docker exec skyportal-web cat .tokens.yaml | grep "INITIAL_ADMIN:" | cut -d':' -f2 | tr -d ' ')
+
+        if [ -z "$SKYPORTAL_TOKEN" ]; then
+          echo "Failed to extract SkyPortal token"
+          exit 1
+        fi
+
+        echo "SKYPORTAL_TOKEN=$SKYPORTAL_TOKEN" >> $GITHUB_OUTPUT
+
+    - name: Create test environment file
+      run: |
+        cd skyportal_processor_service
+        echo "Creating test environment file."
+        cat > .env << EOF
+        # OwnCloud Configuration
+        OWNCLOUD_BASE_URL=${{ env.OWNCLOUD_BASE_URL }}
+        OWNCLOUD_USERNAME=${{ env.OWNCLOUD_USERNAME }}
+        OWNCLOUD_TOKEN=${{ env.OWNCLOUD_TOKEN }}
+        OWNCLOUD_USER_ID=${{ env.OWNCLOUD_USER_ID }}
+
+        # SkyPortal Configuration
+        SKYPORTAL_URL=http://localhost:9000
+        SKYPORTAL_TOKEN=${{ steps.extract_skyportal_token.outputs.SKYPORTAL_TOKEN }}
+
+        # StdWeb Configuration
+        STDWEB_URL=http://localhost:8000
+        STDWEB_TOKEN=${{ steps.extract_stdweb_token.outputs.STDWEB_TOKEN }}
+
+        # Application Settings
+        SAVE_PATH=${{ env.SAVE_PATH }}
+        STDWEB_SAVE_PATH=${{ env.STDWEB_SAVE_PATH }}
+        POLL_INTERVAL=${{ env.POLL_INTERVAL }}
+        GROUP_IDS=${{ env.GROUP_IDS }}
+        SOURCE_TAG=${{ env.SOURCE_TAG }}
+        SKYPORTAL_COMMAND=${{ env.SKYPORTAL_COMMAND }}
+        START_TIME=${{ env.START_TIME }}
+        EOF
+        echo "Environment file created"
+
+    - name: Install python dependencies
+      run: |
+        cd skyportal_processor_service
+        echo "Installing comment watcher dependencies."
+        pip install -r requirements.txt
+
+    - name: Install Playwright browser
+      run: |
+        # test_integration_comment_watcher.py drives a real headless browser to
+        # post a non-bot comment -- SkyPortal marks any token-authenticated
+        # request as bot=True (see skyportal/handlers/api/comment.py), so a
+        # plain `requests` POST can never trigger comment_watcher.py at all.
+        python -m playwright install --with-deps chromium
+
+    - name: Test comment watcher startup
+      run: |
+        cd skyportal_processor_service
+        echo "Testing comment watcher startup (waiting for 'Listening for new sources...' or 60s timeout)..."
+
+        python comment_watcher.py --env-file .env > watcher.log 2>&1 &
+        WATCHER_PID=$!
+        echo "WATCHER_PID=$WATCHER_PID" >> $GITHUB_ENV
+
+        echo "Comment watcher started with PID: $WATCHER_PID"
+
+        TIMEOUT=60
+        ELAPSED=0
+        SUCCESS=false
+
+        while [ $ELAPSED -lt $TIMEOUT ]; do
+          if ! kill -0 $WATCHER_PID 2>/dev/null; then
+            echo "Comment watcher process has stopped unexpectedly"
+            cat watcher.log
+            exit 1
+          fi
+
+          if grep -q "Listening for new sources..." watcher.log 2>/dev/null; then
+            echo "Comment watcher is listening"
+            SUCCESS=true
+            break
+          fi
+
+          if grep -q "ERROR" watcher.log; then
+            echo "Error detected in comment watcher logs"
+            cat watcher.log
+            kill $WATCHER_PID 2>/dev/null || true
+            exit 1
+          fi
+
+          sleep 2
+          ELAPSED=$((ELAPSED + 2))
+        done
+
+        if [ "$SUCCESS" = false ]; then
+          echo "Timeout reached (60s) without seeing 'Listening for new sources...' log"
+          cat watcher.log
+          kill $WATCHER_PID 2>/dev/null || true
+          exit 1
+        fi
+
+        echo "Comment watcher startup test completed successfully -- leaving it running for the integration test"
+
+    - name: Run comment watcher integration test
+      run: |
+        cd skyportal_processor_service/tests
+        echo "Running pytest against the live comment watcher..."
+        python -m pytest test_integration_comment_watcher.py -v -s
+        echo "Integration test completed"
+
+    - name: Stop comment watcher
+      if: always()
+      run: |
+        kill $WATCHER_PID 2>/dev/null || true
+        wait $WATCHER_PID 2>/dev/null || true
+
+    - name: Show container logs
+      if: always()
+      run: |
+        echo "Collecting container logs for debugging..."
+        mkdir -p debug_logs
+
+        docker logs owncloud_server > debug_logs/owncloud.log 2>&1 || echo "Failed to get owncloud logs" > debug_logs/owncloud.log
+        docker logs skyportal-web > debug_logs/skyportal.log 2>&1 || echo "Failed to get skyportal logs" > debug_logs/skyportal.log
+        docker logs postgres16 > debug_logs/postgres.log 2>&1 || echo "Failed to get postgres logs" > debug_logs/postgres.log
+        docker logs stdweb-web > debug_logs/stdweb.log 2>&1 || echo "Failed to get stdweb logs" > debug_logs/stdweb.log
+        docker ps -a > debug_logs/containers_status.txt 2>&1 || echo "Failed to get containers status" > debug_logs/containers_status.txt
+
+        echo "Debug logs collected and will be saved to artifacts"
+
+    - name: Save debug artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: debug-logs
+        path: |
+          debug_logs/
+          skyportal_processor_service/watcher.log
+        retention-days: 7
+
+    - name: Cleanup
+      if: always()
+      run: |
+        echo "Cleaning up services..."
+        cd skyportal_processor_service && docker compose down -v || true
+        echo "Cleanup completed"
