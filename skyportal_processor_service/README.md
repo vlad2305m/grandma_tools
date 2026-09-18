@@ -48,3 +48,17 @@ See `.env.default` for the full list of environment variables. Notably:
   `SKYPORTAL_TOKEN`/`SKYPORTAL_BASE_URL` configured (StdWeb performs the
   SkyPortal upload itself, using its own credentials -- see
   `stdweb/REST_API.md`).
+
+## Testing policy: OwnCloud is read-only, always
+
+`comment_watcher.py` never writes to OwnCloud (only `PROPFIND`/`GET`) -- it's
+strictly a consumer of files other tools put there. Tests follow the same
+rule, including against the disposable Docker sandbox in
+`docker-compose.yaml`: `tests/test_integration_comment_watcher.py` seeds its
+fixture file by writing directly to OwnCloud's bind-mounted data directory
+(`OWNCLOUD_DATA_PATH`, see `.env.default`) and triggering a local `occ
+files:scan` via `docker exec`, never a WebDAV `PUT`/`MKCOL`/`DELETE`. When
+testing manually against a real (non-Docker) OwnCloud instance, this means
+using files that already exist there -- never create or upload new ones for
+a test, since there is no "local storage" to write to directly on a remote
+instance.

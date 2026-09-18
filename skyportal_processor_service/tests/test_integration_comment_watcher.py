@@ -1,4 +1,6 @@
 import os
+import shutil
+import subprocess
 import sys
 import time
 import uuid
@@ -7,16 +9,16 @@ import pytest
 import requests
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
-from requests.auth import HTTPBasicAuth
 
 load_dotenv("../.env")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from comment_watcher import job_from_comment  # noqa: E402
 
-OWNCLOUD_BASE_URL = os.getenv("OWNCLOUD_BASE_URL")
-OWNCLOUD_USERNAME = os.getenv("OWNCLOUD_USERNAME")
-OWNCLOUD_TOKEN = os.getenv("OWNCLOUD_TOKEN")
+# OwnCloud's on-disk data directory, as bind-mounted by docker-compose.yaml --
+# tests seed fixture files by writing here directly (see seed_owncloud_file
+# below), never through OwnCloud's own write API.
+OWNCLOUD_DATA_PATH = os.getenv("OWNCLOUD_DATA_PATH", "../data/owncloud")
 OWNCLOUD_USER_ID = os.getenv("OWNCLOUD_USER_ID")
 SAVE_PATH = os.getenv("SAVE_PATH")
 
@@ -36,24 +38,28 @@ FIXTURE_DEC = -44.1159352530986
 
 SOURCE_ID = f"CIRESCANTEST{uuid.uuid4().hex[:8]}"
 TELESCOPE_FOLDER = "TAROT-TCA"
-OWNCLOUD_AUTH = HTTPBasicAuth(OWNCLOUD_USERNAME, OWNCLOUD_TOKEN)
 
 
-def owncloud_mkcol(path):
-    requests.request(
-        "MKCOL",
-        f"{OWNCLOUD_BASE_URL}/remote.php/dav/files/{OWNCLOUD_USER_ID}/{path}",
-        auth=OWNCLOUD_AUTH,
+def seed_owncloud_file(relative_path, fixture_path):
+    """
+    Place a file directly in OwnCloud's on-disk storage, bypassing OwnCloud's
+    own write API entirely (no PUT/MKCOL) -- see docker-compose.yaml's
+    owncloud service, which bind-mounts its data dir to ./data/owncloud so
+    this is possible. OwnCloud indexes files into a DB-backed cache separate
+    from the raw filesystem, so a `files:scan` is still needed afterward for
+    WebDAV/PROPFIND (what comment_watcher.py reads with) to see it -- that's
+    a local `docker exec` maintenance command, not a network write against
+    OwnCloud's API.
+    """
+    # Standard ownCloud local-storage layout: {datadir}/{user}/files/{path}.
+    dest = os.path.join(OWNCLOUD_DATA_PATH, OWNCLOUD_USER_ID, "files", relative_path)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.copyfile(fixture_path, dest)
+
+    subprocess.run(
+        ["docker", "exec", "owncloud_server", "occ", "files:scan", OWNCLOUD_USER_ID],
+        check=True,
     )
-
-
-def owncloud_put_file(path, content):
-    response = requests.put(
-        f"{OWNCLOUD_BASE_URL}/remote.php/dav/files/{OWNCLOUD_USER_ID}/{path}",
-        data=content,
-        auth=OWNCLOUD_AUTH,
-    )
-    response.raise_for_status()
 
 
 def post_comment_via_ui(source_id, text):
@@ -103,12 +109,9 @@ def seed_source_and_file():
     )
     response.raise_for_status()
 
-    owncloud_mkcol(f"{SAVE_PATH}/{SOURCE_ID}")
-    owncloud_mkcol(f"{SAVE_PATH}/{SOURCE_ID}/{TELESCOPE_FOLDER}")
-    with open(FIXTURE_PATH, "rb") as f:
-        owncloud_put_file(
-            f"{SAVE_PATH}/{SOURCE_ID}/{TELESCOPE_FOLDER}/test_image.fits", f.read()
-        )
+    seed_owncloud_file(
+        f"{SAVE_PATH}/{SOURCE_ID}/{TELESCOPE_FOLDER}/test_image.fits", FIXTURE_PATH
+    )
 
     yield
     # No cleanup: this only runs against ephemeral CI containers (owncloud,
