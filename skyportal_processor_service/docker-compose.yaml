@@ -1,8 +1,6 @@
 version: "3"
 
 volumes:
-  files:
-    driver: local
   mysql:
     driver: local
   redis:
@@ -41,7 +39,11 @@ services:
       timeout: 10s
       retries: 5
     volumes:
-      - files:/mnt/data
+      # Host bind mount (not a named Docker volume) so tests/local dev can
+      # seed fixture files by writing directly to disk -- see
+      # tests/test_integration_comment_watcher.py -- instead of ever going
+      # through OwnCloud's own write API, even in this disposable sandbox.
+      - ./data/owncloud:/mnt/data
 
   mariadb:
     image: mariadb:10.11 # minimum required ownCloud version is 10.9

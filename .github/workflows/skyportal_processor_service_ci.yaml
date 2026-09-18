@@ -10,6 +10,11 @@ env:
   OWNCLOUD_USERNAME: "admin"
   OWNCLOUD_TOKEN: "admin"
   OWNCLOUD_USER_ID: "admin"
+  # Host path of the owncloud service's bind-mounted data dir (see
+  # docker-compose.yaml) -- tests write fixture files here directly instead
+  # of through OwnCloud's write API. Matches the default in
+  # test_integration_comment_watcher.py; set explicitly for clarity.
+  OWNCLOUD_DATA_PATH: "../data/owncloud"
 
   SAVE_PATH: "Candidates/Skyportal"
   STDWEB_SAVE_PATH: ""
@@ -134,6 +139,7 @@ jobs:
         OWNCLOUD_USERNAME=${{ env.OWNCLOUD_USERNAME }}
         OWNCLOUD_TOKEN=${{ env.OWNCLOUD_TOKEN }}
         OWNCLOUD_USER_ID=${{ env.OWNCLOUD_USER_ID }}
+        OWNCLOUD_DATA_PATH=${{ env.OWNCLOUD_DATA_PATH }}
 
         # SkyPortal Configuration
         SKYPORTAL_URL=http://localhost:9000

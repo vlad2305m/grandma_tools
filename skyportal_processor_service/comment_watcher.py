@@ -673,10 +673,6 @@ def main_loop(start_time: datetime) -> None:
     Args:
         start_time: Datetime to start monitoring from
     """
-    # try:
-    #     create_base_folder_on_owncloud()
-    # except Exception as e:
-    #     logger.error(f"Error during base folder creation: {e}")
 
     logger.info("Listening for new sources...\n")
 
