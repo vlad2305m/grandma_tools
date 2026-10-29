@@ -13,7 +13,7 @@ from playwright.sync_api import sync_playwright
 load_dotenv("../.env")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from comment_watcher import LEDGER_SERVICE_NAME  # noqa: E402
+from comment_watcher import RESCAN_SERVICE_NAME  # noqa: E402
 
 # OwnCloud's on-disk data directory, as bind-mounted by docker-compose.yaml --
 # tests seed fixture files by writing here directly (see seed_owncloud_file
@@ -103,12 +103,13 @@ def get_ledger(source_id):
     Fetch the current processed/failed file ledger for a source directly from
     the Analysis Service comment_watcher.py persists it in (see
     save_ledger/restore_ledger in comment_watcher.py) -- replaces decoding it
-    out of a bot reply comment.
+    out of a bot reply comment. Mirrors restore_ledger's own "latest
+    completed entry" logic.
     """
     response = requests.get(f"{SKYPORTAL_URL}/api/analysis_service", headers=SKYPORTAL_HEADERS)
     response.raise_for_status()
     service_id = next(
-        s["id"] for s in response.json()["data"] if s["name"] == LEDGER_SERVICE_NAME
+        s["id"] for s in response.json()["data"] if s["name"] == RESCAN_SERVICE_NAME
     )
 
     response = requests.get(
@@ -117,9 +118,9 @@ def get_ledger(source_id):
         params={"analysisServiceID": service_id},
     )
     response.raise_for_status()
-    entries = response.json()["data"]
-    assert entries, f"No ledger entry for {source_id}"
-    latest_id = max(e["id"] for e in entries)
+    completed = [e for e in response.json()["data"] if e.get("status") == "completed"]
+    assert completed, f"No completed ledger entry for {source_id}"
+    latest_id = max(e["id"] for e in completed)
 
     response = requests.get(
         f"{SKYPORTAL_URL}/api/obj/analysis/{latest_id}",

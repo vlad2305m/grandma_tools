@@ -1,8 +1,11 @@
 import argparse
 import os
+import queue
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import traceback
 from typing import Dict, List, Optional, Set, Tuple
 import json
@@ -35,13 +38,21 @@ jobformat_version = 0.2
 # numeric depth is used instead; the server naturally stops at the actual tree depth.
 OWNCLOUD_SCAN_DEPTH = 10
 
-# Analysis Service used to persist each source's processed/failed file ledger
-# (replaces the old mechanism of embedding job state as hidden unicode variation
-# selectors appended to every bot reply comment and decoding/unioning them back
-# on restart). upload_only, never shown on a source page. Created once per
-# SkyPortal instance -- see get_or_create_ledger_service.
-LEDGER_SERVICE_NAME = "grandma_file_processing_ledger"
-LEDGER_SERVICE_ID: int = -1  # resolved once at startup
+# Analysis Service that's both runnable (SkyPortal's "Run Analysis" button
+# triggers a rescan via a webhook, same as any comment does) and the storage
+# for each source's processed/failed file ledger (replaces the old mechanism
+# of embedding job state as hidden unicode variation selectors appended to
+# every bot reply comment and decoding/unioning them back on restart).
+# Created once per SkyPortal instance -- see get_or_create_rescan_service.
+# Webhook-runnable only if WEBHOOK_URL is configured; upload_only (ledger
+# storage only, as before) otherwise -- see get_or_create_rescan_service.
+RESCAN_SERVICE_NAME = "grandma_rescan"
+RESCAN_SERVICE_ID: int = -1  # resolved once at startup
+
+# Webhook-triggered RescanJobs land here (from WebhookHandler.do_POST, which
+# runs on the HTTP server's own thread) and are drained into `pipeline` at the
+# top of each main_loop iteration (the only thread that mutates `pipeline`).
+trigger_queue: "queue.Queue[RescanJob]" = queue.Queue()
 
 
 @dataclass
@@ -75,6 +86,10 @@ class RescanJob:
     ra: float = 0
     dec: float = 0
     author: str = ""
+    # Set only for a job triggered via SkyPortal's "Run Analysis" webhook
+    # (see WebhookHandler) rather than a comment -- where to POST the result
+    # when the job finishes. "" for comment-triggered jobs.
+    callback_url: str = ""
     processed_files: List[str] = field(default_factory=list)  # successfully processed, cumulative across rescans
     failed_files: List[str] = field(default_factory=list)  # permanently failed, cumulative across rescans
     file_jobs: List[FileJob] = field(default_factory=list)  # this rescan's in-flight files
@@ -104,44 +119,68 @@ class RescanJob:
 pipeline: List[RescanJob] = []
 
 
-def get_or_create_ledger_service() -> int:
+def get_or_create_rescan_service() -> int:
     """
-    Find the LEDGER_SERVICE_NAME Analysis Service, or create it if this is the
-    first run against this SkyPortal instance. Called once at startup.
+    Find the RESCAN_SERVICE_NAME Analysis Service, or create it if this is the
+    first run against this SkyPortal instance; update it if WEBHOOK_URL's
+    presence/absence no longer matches how it's currently configured there
+    (e.g. it's being turned on or off for an existing deployment). Called
+    once at startup.
 
-    Finding it only needs an ordinary token (GET is unrestricted); creating it
-    needs the "Manage Analysis Services" ACL, which SKYPORTAL_TOKEN won't have
-    in most production setups (it only needs "Run Analyses" for everything
-    else this service does) -- if it's missing and the service doesn't already
-    exist, fail loudly with the exact payload an admin needs to POST once.
+    Finding it only needs an ordinary token (GET is unrestricted); creating
+    or updating it needs the "Manage Analysis Services" ACL, which
+    SKYPORTAL_TOKEN won't have in most production setups (it only needs "Run
+    Analyses" for everything else this service does). If it's missing and
+    SKYPORTAL_TOKEN can't create it, fail loudly with the exact payload an
+    admin needs to POST once. If it already exists but can't be updated,
+    warn and keep using it as currently configured there -- this only matters
+    if WEBHOOK_URL was just added or removed.
     """
+    desired = {
+        "upload_only": not bool(WEBHOOK_URL),
+        "url": f"{WEBHOOK_URL}/trigger" if WEBHOOK_URL else f"{INSTANCE_URL}/not-a-real-analysis-endpoint",
+        "display_on_resource_dropdown": bool(WEBHOOK_URL),
+    }
+
     response = requests.get(f"{INSTANCE_URL}/api/analysis_service", headers=header)
     response.raise_for_status()
     for service in response.json()["data"]:
-        if service["name"] == LEDGER_SERVICE_NAME:
+        if service["name"] == RESCAN_SERVICE_NAME:
+            if any(service.get(k) != v for k, v in desired.items()):
+                patch = requests.patch(
+                    f"{INSTANCE_URL}/api/analysis_service/{service['id']}", headers=header, json=desired
+                )
+                if patch.status_code != 200:
+                    logger.warning(
+                        f"Could not update {RESCAN_SERVICE_NAME!r} to match the current WEBHOOK_URL "
+                        f"config (needs \"Manage Analysis Services\"); leaving it as currently configured "
+                        f"on SkyPortal. Server response: {patch.status_code} {patch.text}"
+                    )
             return service["id"]
 
     create_payload = {
-        "name": LEDGER_SERVICE_NAME,
-        "display_name": "GRANDMA File-Processing Ledger",
+        "name": RESCAN_SERVICE_NAME,
+        "display_name": "GRANDMA Rescan",
         "description": (
-            "Internal bookkeeping for comment_watcher.py: which OwnCloud files "
-            "have been processed per source. Not a real analysis service -- "
-            "upload_only, never shown on the source page."
+            "Rescans a source's OwnCloud folder for new FITS files, runs StdWeb "
+            "forced photometry on each, and uploads the result to SkyPortal -- "
+            "the same thing any comment on the source already triggers. Click "
+            '"Run Analysis" to trigger it directly, without posting a comment. '
+            "Also used internally to persist the per-source processed/failed "
+            "file ledger across runs."
         ),
-        "url": f"{INSTANCE_URL}/not-a-real-analysis-endpoint",
         "authentication_type": "none",
         "analysis_type": "meta_analysis",
         "input_data_types": [],
-        "upload_only": True,
-        "display_on_resource_dropdown": False,
+        "timeout": 7200,
+        **desired,
     }
     if SKYPORTAL_GROUP_IDS_FILTER:
         create_payload["group_ids"] = SKYPORTAL_GROUP_IDS_FILTER
     response = requests.post(f"{INSTANCE_URL}/api/analysis_service", headers=header, json=create_payload)
     if response.status_code != 200:
         raise RuntimeError(
-            f"Analysis service {LEDGER_SERVICE_NAME!r} doesn't exist yet and SKYPORTAL_TOKEN can't "
+            f"Analysis service {RESCAN_SERVICE_NAME!r} doesn't exist yet and SKYPORTAL_TOKEN can't "
             f"create it (needs the \"Manage Analysis Services\" ACL -- ordinary \"Run Analyses\" isn't "
             f"enough). Ask a SkyPortal admin to POST this once to {INSTANCE_URL}/api/analysis_service "
             f"(with their own, more privileged token), then restart this service:\n"
@@ -154,26 +193,32 @@ def get_or_create_ledger_service() -> int:
 def restore_ledger(source_id: str) -> Tuple[List[str], List[str], Dict[str, dict]]:
     """
     Recover (processed_files, failed_files, file_details) for a source from its
-    most recent ledger entry (an upload_only ObjAnalysis against
-    LEDGER_SERVICE_ID -- see get_or_create_ledger_service). Empty/default if
-    the source has never had one.
+    most recent *completed* ledger entry against RESCAN_SERVICE_ID (either a
+    save_ledger upload, or a successfully-finished webhook-triggered run --
+    see WebhookHandler/send_webhook_callback). Empty/default if the source has
+    never had one.
+
+    Only "completed" entries count: an in-flight ("queued"/"pending") or
+    failed webhook-triggered run can share analysisServiceID with real ledger
+    entries, and must not look like "this source has no ledger yet" to a
+    rescan that happens to restore concurrently -- see prune_ledger_entries.
 
     Replaces the old mechanism of decoding hidden unicode variation selectors
     appended to every bot reply comment and unioning the result across all of
-    them: save_ledger always writes the full cumulative state in one entry, and
-    prunes every older entry for the source, so trusting the single latest
-    entry here is correct (not a union) -- see save_ledger.
+    them: a save always writes the full cumulative state in one entry, and
+    prune_ledger_entries removes every older entry for the source, so trusting
+    the single latest completed entry here is correct (not a union).
     """
     response = requests.get(
         f"{INSTANCE_URL}/api/obj/{source_id}/analysis",
         headers=header,
-        params={"analysisServiceID": LEDGER_SERVICE_ID},
+        params={"analysisServiceID": RESCAN_SERVICE_ID},
     )
     response.raise_for_status()
-    entries = response.json()["data"]
-    if not entries:
+    completed = [e for e in response.json()["data"] if e.get("status") == "completed"]
+    if not completed:
         return [], [], {}
-    latest_id = max(e["id"] for e in entries)
+    latest_id = max(e["id"] for e in completed)
 
     response = requests.get(
         f"{INSTANCE_URL}/api/obj/analysis/{latest_id}",
@@ -191,14 +236,34 @@ def restore_ledger(source_id: str) -> Tuple[List[str], List[str], Dict[str, dict
     )
 
 
+def prune_ledger_entries(source_id: str) -> None:
+    """
+    Delete every ObjAnalysis entry for this source against RESCAN_SERVICE_ID
+    except the newest (by id) -- keeps at most one at all times, regardless of
+    whether entries came from save_ledger uploads or webhook-triggered runs,
+    well under SkyPortal's analysis_services.max_analysis_per_obj_per_user
+    cap. Called after every completion (see save_ledger/send_webhook_callback).
+    Safe without locking/transactions: only one instance of this service runs
+    at a time.
+    """
+    response = requests.get(
+        f"{INSTANCE_URL}/api/obj/{source_id}/analysis",
+        headers=header,
+        params={"analysisServiceID": RESCAN_SERVICE_ID},
+    )
+    response.raise_for_status()
+    entries = sorted(response.json()["data"], key=lambda e: e["id"])
+    for stale in entries[:-1]:
+        requests.delete(f"{INSTANCE_URL}/api/obj/analysis/{stale['id']}", headers=header).raise_for_status()
+
+
 def save_ledger(job: RescanJob) -> None:
     """
     Upload the current cumulative processed/failed file ledger for job.source_id
-    as a new ObjAnalysis entry, then delete every older entry for this source --
-    keeps exactly one ledger entry per source at all times, well under
-    SkyPortal's analysis_services.max_analysis_per_obj_per_user cap. Safe
-    without locking/transactions: only one instance of this service runs at a
-    time.
+    as a new ObjAnalysis entry (status "completed" immediately), then prune
+    every older entry for this source -- see prune_ledger_entries. Used for
+    comment-triggered jobs; a webhook-triggered job's completion callback
+    (see send_webhook_callback) plays the same role instead.
     """
     payload = {
         "message": f"{len(job.processed_files)} processed, {len(job.failed_files)} failed (as of job #{job.job_id})",
@@ -219,22 +284,48 @@ def save_ledger(job: RescanJob) -> None:
     if SKYPORTAL_GROUP_IDS_FILTER:
         payload["group_ids"] = SKYPORTAL_GROUP_IDS_FILTER
     response = requests.post(
-        f"{INSTANCE_URL}/api/obj/{job.source_id}/analysis_upload/{LEDGER_SERVICE_ID}",
+        f"{INSTANCE_URL}/api/obj/{job.source_id}/analysis_upload/{RESCAN_SERVICE_ID}",
         headers=header,
         json=payload,
     )
     response.raise_for_status()
+    prune_ledger_entries(job.source_id)
 
-    response = requests.get(
-        f"{INSTANCE_URL}/api/obj/{job.source_id}/analysis",
-        headers=header,
-        params={"analysisServiceID": LEDGER_SERVICE_ID},
-    )
-    response.raise_for_status()
-    entries = sorted(response.json()["data"], key=lambda e: e["id"])
-    for stale in entries[:-1]:
-        requests.delete(f"{INSTANCE_URL}/api/obj/analysis/{stale['id']}", headers=header).raise_for_status()
 
+def send_webhook_callback(job: RescanJob) -> None:
+    """
+    Report completion back to SkyPortal for a job triggered via its "Run
+    Analysis" webhook (job.callback_url set -- see WebhookHandler) rather than
+    a comment. Matches the contract at https://skyportal.io/docs/analysis.html:
+    POST {"status", "message", "analysis": {"results": {...}}} to the
+    callback_url embedded in the original trigger request; SkyPortal records
+    this as a "completed" (success) or "failure" ObjAnalysis entry, which
+    restore_ledger then reads the same way it reads a save_ledger upload. The
+    callback token is single-use, so this always fires exactly once per run.
+    """
+    status = "success" if job.stage == 1000 else "failure"
+    payload = {
+        "status": status,
+        "message": f"{len(job.processed_files)} processed, {len(job.failed_files)} failed (as of job #{job.job_id})",
+        "analysis": {
+            "results": {
+                "format": "json",
+                "data": {
+                    "processed_files": job.processed_files,
+                    "failed_files": job.failed_files,
+                    "file_details": job.file_details,
+                },
+            }
+        },
+    }
+    try:
+        response = requests.post(job.callback_url, json=payload)
+        response.raise_for_status()
+    except Exception:
+        traceback.print_exc()
+        logger.error(f"Could not deliver webhook callback for job #{job.job_id} ({job.source_id})")
+        return
+    prune_ledger_entries(job.source_id)
 
 
 def get_new_comments(
@@ -342,12 +433,15 @@ def get_new_comments(
 
 def comment_back(job: RescanJob, message: str) -> None:
     """
-    Post a comment to SkyPortal to report the progress of the job.
+    Post a comment to SkyPortal to report the progress of the job. job.author
+    is empty for a webhook-triggered job (no triggering comment to take it
+    from -- see WebhookHandler), which drops the trailing @mention entirely.
     """
+    text = f"{message} @{job.author}" if job.author else message
     response = requests.post(
         f"{INSTANCE_URL}/api/sources/{job.source_id}/comments",
         json={
-            "text": f"{message} @{job.author}",
+            "text": text,
             #"group_ids": SKYPORTAL_GROUP_IDS_FILTER,
         },
         headers=header,
@@ -517,59 +611,64 @@ def pipeline_tick(job: RescanJob) -> bool:
     Returns whether the job has finished
     """
     try:
-        if job.stage <= 1:  # Immediately after seeing the comment
-            response = requests.get(
-                f"{INSTANCE_URL}/api/sources/{job.source_id}/comments",
-                headers=header,
-            )
-            response.raise_for_status()
-            comments = response.json()["data"]
+        if job.stage <= 1:  # Immediately after seeing the comment (or webhook trigger)
+            if job.callback_url:
+                # Triggered via the "Run Analysis" webhook (see WebhookHandler),
+                # not a comment -- no comment to fetch or command to parse.
+                pass
+            else:
+                response = requests.get(
+                    f"{INSTANCE_URL}/api/sources/{job.source_id}/comments",
+                    headers=header,
+                )
+                response.raise_for_status()
+                comments = response.json()["data"]
 
-            trigger = next((c for c in comments if c["id"] == job.job_id), None)
-            if trigger is None or trigger.get("bot") is not False:
-                # Comment vanished, or was bot-authored (missing/null bot flag treated
-                # conservatively as bot too). Never legitimately reachable today since
-                # get_new_comments doesn't filter by bot at all -- this check IS the
-                # bot filter now, guarding against a self-triggering reply loop.
-                job.stage = 1000
-                return True
-            job.comment = trigger["text"]
-            job.author = trigger["author_id"]
+                trigger = next((c for c in comments if c["id"] == job.job_id), None)
+                if trigger is None or trigger.get("bot") is not False:
+                    # Comment vanished, or was bot-authored (missing/null bot flag treated
+                    # conservatively as bot too). Never legitimately reachable today since
+                    # get_new_comments doesn't filter by bot at all -- this check IS the
+                    # bot filter now, guarding against a self-triggering reply loop.
+                    job.stage = 1000
+                    return True
+                job.comment = trigger["text"]
+                job.author = trigger["author_id"]
 
-            if SKYPORTAL_COMMAND in job.comment:
-                command = job.comment.split(SKYPORTAL_COMMAND)[1]
-                argv = command.split(" ")
-                help_message = f"Usage: any comment triggers a rescan of this source's OwnCloud directory. Feedback is silent unless new files are found (or fail), or your comment mentions 'owncloud'/'upload'.\nExplicit commands (no space before the keyword):\n{SKYPORTAL_COMMAND}help\n{SKYPORTAL_COMMAND}dump [limit]."
-                if argv[0]:
-                    # This is a special command
-                    if argv[0] == "help":
-                        job.stage = 1000
-                        comment_back(job, help_message)
+                if SKYPORTAL_COMMAND in job.comment:
+                    command = job.comment.split(SKYPORTAL_COMMAND)[1]
+                    argv = command.split(" ")
+                    help_message = f"Usage: any comment triggers a rescan of this source's OwnCloud directory. Feedback is silent unless new files are found (or fail), or your comment mentions 'owncloud'/'upload'.\nExplicit commands (no space before the keyword):\n{SKYPORTAL_COMMAND}help\n{SKYPORTAL_COMMAND}dump [limit]."
+                    if argv[0]:
+                        # This is a special command
+                        if argv[0] == "help":
+                            job.stage = 1000
+                            comment_back(job, help_message)
+                            return True
+                        if argv[0] == "dump":
+                            job.stage = 1000
+                            count = len(pipeline)
+                            if len(argv) > 1 and argv[1].isdigit():
+                                count = min(len(pipeline), int(argv[1]))
+                            comment_back(job, "\n"+"\n".join(map(lambda j: j.serialize(), pipeline[0:count])))
+                            return True
+                        job.stage = 1001
+                        comment_back(job, f"Unrecognized command. {help_message}")
                         return True
-                    if argv[0] == "dump":
-                        job.stage = 1000
-                        count = len(pipeline)
-                        if len(argv) > 1 and argv[1].isdigit():
-                            count = min(len(pipeline), int(argv[1]))
-                        comment_back(job, "\n"+"\n".join(map(lambda j: j.serialize(), pipeline[0:count])))
+                    if job.comment.strip() == SKYPORTAL_COMMAND:
+                        # Bare "@rescan" and nothing else is disallowed: any comment already
+                        # triggers a rescan, and repeating this exact minimal text hits
+                        # SkyPortal's same-author dedup, silently swallowing the retrigger.
+                        # "@rescan" embedded in a larger, naturally-varying comment is fine.
+                        job.stage = 1001
+                        comment_back(
+                            job,
+                            f'Don\'t post a bare "{SKYPORTAL_COMMAND}" \u2014 any comment on this source '
+                            f"already triggers a check, and identical repeated text is silently dropped "
+                            f"by SkyPortal. {help_message}",
+                        )
                         return True
-                    job.stage = 1001
-                    comment_back(job, f"Unrecognized command. {help_message}")
-                    return True
-                if job.comment.strip() == SKYPORTAL_COMMAND:
-                    # Bare "@rescan" and nothing else is disallowed: any comment already
-                    # triggers a rescan, and repeating this exact minimal text hits
-                    # SkyPortal's same-author dedup, silently swallowing the retrigger.
-                    # "@rescan" embedded in a larger, naturally-varying comment is fine.
-                    job.stage = 1001
-                    comment_back(
-                        job,
-                        f'Don\'t post a bare "{SKYPORTAL_COMMAND}" \u2014 any comment on this source '
-                        f"already triggers a check, and identical repeated text is silently dropped "
-                        f"by SkyPortal. {help_message}",
-                    )
-                    return True
-                # "@rescan" mentioned within other text: proceed to a silent rescan.
+                    # "@rescan" mentioned within other text: proceed to a silent rescan.
 
             job.processed_files, job.failed_files, job.file_details = restore_ledger(job.source_id)
             job.stage = 2
@@ -684,12 +783,16 @@ def pipeline_tick_all() -> None:
     Run all tasks in the pipeline and remove the ones that have finished. When a
     job finishes, if another comment arrived for its source while it was running
     (queued in pending_rerun by get_new_comments), start that rerun immediately
-    rather than waiting for the next poll.
+    rather than waiting for the next poll. A finished webhook-triggered job
+    (job.callback_url set) also reports its result back to SkyPortal -- see
+    send_webhook_callback.
     """
     i = 0
     while i < len(pipeline):
         job = pipeline[i]
         if pipeline_tick(job):
+            if job.callback_url:
+                send_webhook_callback(job)
             pipeline.pop(i)
             queued = pending_rerun.pop(job.source_id, None)
             if queued is not None:
@@ -698,11 +801,70 @@ def pipeline_tick_all() -> None:
         else:
             i += 1
 
+class WebhookHandler(BaseHTTPRequestHandler):
+    """
+    Receives SkyPortal's "Run Analysis" webhook call for RESCAN_SERVICE_ID
+    (see get_or_create_rescan_service/run_webhook_server) and turns it into a
+    RescanJob on trigger_queue, same as a comment does for get_new_comments.
+    Runs on its own thread -- see run_webhook_server -- so it never touches
+    `pipeline` directly (that's main_loop's job, draining trigger_queue).
+
+    SkyPortal expects an immediate 200 acknowledging receipt (it records
+    anything else as a failed run); the actual rescan happens later,
+    asynchronously, same as any other job in the pipeline. See
+    send_webhook_callback for how/when the result is reported back.
+    """
+
+    def log_message(self, format, *args):
+        pass  # comment_watcher.py already logs; skip BaseHTTPRequestHandler's default access log
+
+    def do_POST(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length) or b"{}")
+            source_id = body.get("resource_id")
+            callback_url = body.get("callback_url")
+            obj = (body.get("inputs") or {}).get("obj") or {}
+            if not source_id or not callback_url:
+                self.send_response(400)
+                self.end_headers()
+                return
+            trigger_queue.put(RescanJob(
+                source_id=source_id,
+                job_id=int(time.time() * 1000),
+                stage=1,
+                ra=obj.get("ra", 0),
+                dec=obj.get("dec", 0),
+                callback_url=callback_url,
+            ))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status": "success"}')
+        except Exception:
+            traceback.print_exc()
+            self.send_response(500)
+            self.end_headers()
+
+
+def run_webhook_server(host: str, port: int) -> None:
+    """
+    Starts the "Run Analysis" webhook listener on a daemon thread. Only
+    called when WEBHOOK_URL is configured -- see get_or_create_rescan_service
+    and the startup block below.
+    """
+    server = ThreadingHTTPServer((host, port), WebhookHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    logger.info(f"Webhook listener on http://{host}:{port}")
+
+
 def main_loop(start_time: datetime) -> None:
     """
     Main monitoring loop that watches for new comments, creates and runs jobs.
 
-    Continuously polls SkyPortal and runs active pipeline jobs.
+    Continuously polls SkyPortal and runs active pipeline jobs. Also drains
+    trigger_queue (webhook-triggered jobs queued by WebhookHandler, on its own
+    thread) into `pipeline` -- this is the only thread that mutates `pipeline`.
 
     Args:
         start_time: Datetime to start monitoring from
@@ -720,7 +882,12 @@ def main_loop(start_time: datetime) -> None:
                 pipeline.append(job)
             if new_comments:
                 logger.info("Listening for new comments...")
-            
+
+            while not trigger_queue.empty():
+                job = trigger_queue.get_nowait()
+                logger.info(f"New webhook trigger for {job.source_id}")
+                pipeline.append(job)
+
             pipeline_tick_all()
         except Exception as e:
             logger.error(f"Error: {e}")
@@ -793,6 +960,14 @@ if __name__ == "__main__":
             int(x.strip()) for x in os.getenv("GROUP_IDS", "").split(",") if x.strip()
         ]
         SKYPORTAL_COMMAND=os.getenv("SKYPORTAL_COMMAND", "@rescan")
+        # Externally-reachable base URL for this process's own HTTP listener
+        # (e.g. "http://100.90.108.127:8765"), so SkyPortal's "Run Analysis"
+        # button can trigger a rescan directly, not just via a comment -- see
+        # WebhookHandler/get_or_create_rescan_service. Unset (default): the
+        # service stays upload_only (ledger storage only, as before).
+        WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
+        WEBHOOK_LISTEN_HOST = os.getenv("WEBHOOK_LISTEN_HOST", "0.0.0.0")
+        WEBHOOK_LISTEN_PORT = int(os.getenv("WEBHOOK_LISTEN_PORT", "8765"))
         # OwnCloud telescope folder name -> SkyPortal instrument name (exact match),
         # e.g. {"TAROT-TCA": "TAROT Calern imager"}. Required and exhaustive: a file
         # under a telescope folder missing from this map fails stage 7 outright
@@ -808,10 +983,12 @@ if __name__ == "__main__":
     header = {"Authorization": f"token {SKYPORTAL_TOKEN}"}
 
     try:
-        LEDGER_SERVICE_ID = get_or_create_ledger_service()
+        RESCAN_SERVICE_ID = get_or_create_rescan_service()
     except Exception as e:
-        logger.error(f"Could not find or create the {LEDGER_SERVICE_NAME!r} analysis service: {e}")
+        logger.error(f"Could not find or create the {RESCAN_SERVICE_NAME!r} analysis service: {e}")
         exit(1)
+    if WEBHOOK_URL:
+        run_webhook_server(WEBHOOK_LISTEN_HOST, WEBHOOK_LISTEN_PORT)
 
     # Parse start time from environment variable
     start_time_str = os.getenv("START_TIME")
