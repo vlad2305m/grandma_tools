@@ -14,7 +14,6 @@ import logging
 logging.getLogger().setLevel(logging.DEBUG)
 
 # TODO
-# Do we need to continue where left off based on comments? Maybe just start listening from now() and not care about past?
 # verify radec of Skyportal source is the one we need
 # uploading files takes time -> maybe put into separate thread
 # put group id everywhere
@@ -36,6 +35,14 @@ jobformat_version = 0.2
 # numeric depth is used instead; the server naturally stops at the actual tree depth.
 OWNCLOUD_SCAN_DEPTH = 10
 
+# Analysis Service used to persist each source's processed/failed file ledger
+# (replaces the old mechanism of embedding job state as hidden unicode variation
+# selectors appended to every bot reply comment and decoding/unioning them back
+# on restart). upload_only, never shown on a source page. Created once per
+# SkyPortal instance -- see get_or_create_ledger_service.
+LEDGER_SERVICE_NAME = "grandma_file_processing_ledger"
+LEDGER_SERVICE_ID: int = -1  # resolved once at startup
+
 
 @dataclass
 class FileJob:
@@ -50,15 +57,6 @@ class FileJob:
 
     def to_dict(self) -> dict:
         return {"path": self.path, "stdweb_id": self.stdweb_id, "stage": self.stage, "error": self.error}
-
-    @staticmethod
-    def from_dict(fields: dict) -> "FileJob":
-        return FileJob(
-            path=fields["path"],
-            stdweb_id=fields.get("stdweb_id", -1),
-            stage=fields.get("stage", 3),
-            error=fields.get("error", ""),
-        )
 
 
 @dataclass
@@ -80,6 +78,11 @@ class RescanJob:
     processed_files: List[str] = field(default_factory=list)  # successfully processed, cumulative across rescans
     failed_files: List[str] = field(default_factory=list)  # permanently failed, cumulative across rescans
     file_jobs: List[FileJob] = field(default_factory=list)  # this rescan's in-flight files
+    # path -> {"stdweb_id": int, "status": "processed"|"failed", "error": str}, cumulative
+    # across rescans; carried over from the ledger on restore (see restore_ledger),
+    # grows as file_jobs complete. Saved back to the ledger alongside
+    # processed_files/failed_files -- see save_ledger.
+    file_details: Dict[str, dict] = field(default_factory=dict)
     version: float = jobformat_version
 
     # Dict is very inefficient, but back-compatible
@@ -95,48 +98,143 @@ class RescanJob:
             "processed_files": self.processed_files,
             "failed_files": self.failed_files,
             "file_jobs": [f.to_dict() for f in self.file_jobs],
+            "file_details": self.file_details,
             "version": self.version,
             })
-
-    @staticmethod
-    def deserialize(string: str) -> "RescanJob":
-        fields = json.loads(string)
-        return RescanJob(
-            comment=fields["comment"],
-            source_id=fields["source_id"],
-            job_id=fields["job_id"],
-            stage=fields["stage"],
-            ra=fields.get("ra", 0),
-            dec=fields.get("dec", 0),
-            author=fields.get("author", ""),
-            processed_files=fields.get("processed_files", []),
-            failed_files=fields.get("failed_files", []),
-            file_jobs=[FileJob.from_dict(f) for f in fields.get("file_jobs", [])],
-            version=fields.get("version", 0.0),
-        )
 pipeline: List[RescanJob] = []
 
 
-def str_to_varsel_str(message: str) -> str:
+def get_or_create_ledger_service() -> int:
     """
-    Encode a string as a string of variation selectors (invisible unicode characters that take up 0 pixels).
-    Each two characters in the output string are 4 bytes in total and they encode 1 byte of the input string.
-    """
-    return "".join(map(lambda x: chr(0xfe00+x%16)+chr(0xfe00+x//16), message.encode("utf-8")))
+    Find the LEDGER_SERVICE_NAME Analysis Service, or create it if this is the
+    first run against this SkyPortal instance. Called once at startup.
 
+    Finding it only needs an ordinary token (GET is unrestricted); creating it
+    needs the "Manage Analysis Services" ACL, which SKYPORTAL_TOKEN won't have
+    in most production setups (it only needs "Run Analyses" for everything
+    else this service does) -- if it's missing and the service doesn't already
+    exist, fail loudly with the exact payload an admin needs to POST once.
+    """
+    response = requests.get(f"{INSTANCE_URL}/api/analysis_service", headers=header)
+    response.raise_for_status()
+    for service in response.json()["data"]:
+        if service["name"] == LEDGER_SERVICE_NAME:
+            return service["id"]
 
-def varsel_str_to_str(invisible_chars: str) -> str:
-    """
-    Decode a string from a string of variation selectors (invisible unicode characters that take up 0 pixels).
-    Each two characters in the input string are 4 bytes in total and they encode 1 byte of the output string. Therefore the length of the input must be even.
-    """
-    bytelist = []
-    for i in range(0, len(invisible_chars)-1, 2):
-        bytelist.append(
-            (ord(invisible_chars[i  ])-0xfe00) + 
-            (ord(invisible_chars[i+1])-0xfe00) * 16
+    create_payload = {
+        "name": LEDGER_SERVICE_NAME,
+        "display_name": "GRANDMA File-Processing Ledger",
+        "description": (
+            "Internal bookkeeping for comment_watcher.py: which OwnCloud files "
+            "have been processed per source. Not a real analysis service -- "
+            "upload_only, never shown on the source page."
+        ),
+        "url": f"{INSTANCE_URL}/not-a-real-analysis-endpoint",
+        "authentication_type": "none",
+        "analysis_type": "meta_analysis",
+        "input_data_types": [],
+        "upload_only": True,
+        "display_on_resource_dropdown": False,
+    }
+    if SKYPORTAL_GROUP_IDS_FILTER:
+        create_payload["group_ids"] = SKYPORTAL_GROUP_IDS_FILTER
+    response = requests.post(f"{INSTANCE_URL}/api/analysis_service", headers=header, json=create_payload)
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Analysis service {LEDGER_SERVICE_NAME!r} doesn't exist yet and SKYPORTAL_TOKEN can't "
+            f"create it (needs the \"Manage Analysis Services\" ACL -- ordinary \"Run Analyses\" isn't "
+            f"enough). Ask a SkyPortal admin to POST this once to {INSTANCE_URL}/api/analysis_service "
+            f"(with their own, more privileged token), then restart this service:\n"
+            f"{json.dumps(create_payload, indent=2)}\n"
+            f"Server response: {response.status_code} {response.text}"
         )
-    return bytes(bytelist).decode("utf-8")
+    return response.json()["data"]["id"]
+
+
+def restore_ledger(source_id: str) -> Tuple[List[str], List[str], Dict[str, dict]]:
+    """
+    Recover (processed_files, failed_files, file_details) for a source from its
+    most recent ledger entry (an upload_only ObjAnalysis against
+    LEDGER_SERVICE_ID -- see get_or_create_ledger_service). Empty/default if
+    the source has never had one.
+
+    Replaces the old mechanism of decoding hidden unicode variation selectors
+    appended to every bot reply comment and unioning the result across all of
+    them: save_ledger always writes the full cumulative state in one entry, and
+    prunes every older entry for the source, so trusting the single latest
+    entry here is correct (not a union) -- see save_ledger.
+    """
+    response = requests.get(
+        f"{INSTANCE_URL}/api/obj/{source_id}/analysis",
+        headers=header,
+        params={"analysisServiceID": LEDGER_SERVICE_ID},
+    )
+    response.raise_for_status()
+    entries = response.json()["data"]
+    if not entries:
+        return [], [], {}
+    latest_id = max(e["id"] for e in entries)
+
+    response = requests.get(
+        f"{INSTANCE_URL}/api/obj/analysis/{latest_id}",
+        headers=header,
+        params={"includeAnalysisData": True},
+    )
+    response.raise_for_status()
+    data = response.json()["data"].get("data") or {}
+    results = data.get("results") or {}
+    ledger = results.get("data") or {}
+    return (
+        ledger.get("processed_files", []),
+        ledger.get("failed_files", []),
+        ledger.get("file_details", {}),
+    )
+
+
+def save_ledger(job: RescanJob) -> None:
+    """
+    Upload the current cumulative processed/failed file ledger for job.source_id
+    as a new ObjAnalysis entry, then delete every older entry for this source --
+    keeps exactly one ledger entry per source at all times, well under
+    SkyPortal's analysis_services.max_analysis_per_obj_per_user cap. Safe
+    without locking/transactions: only one instance of this service runs at a
+    time.
+    """
+    payload = {
+        "message": f"{len(job.processed_files)} processed, {len(job.failed_files)} failed (as of job #{job.job_id})",
+        "show_parameters": False,
+        "show_plots": False,
+        "show_corner": False,
+        "analysis": {
+            "results": {
+                "format": "json",
+                "data": {
+                    "processed_files": job.processed_files,
+                    "failed_files": job.failed_files,
+                    "file_details": job.file_details,
+                },
+            }
+        },
+    }
+    if SKYPORTAL_GROUP_IDS_FILTER:
+        payload["group_ids"] = SKYPORTAL_GROUP_IDS_FILTER
+    response = requests.post(
+        f"{INSTANCE_URL}/api/obj/{job.source_id}/analysis_upload/{LEDGER_SERVICE_ID}",
+        headers=header,
+        json=payload,
+    )
+    response.raise_for_status()
+
+    response = requests.get(
+        f"{INSTANCE_URL}/api/obj/{job.source_id}/analysis",
+        headers=header,
+        params={"analysisServiceID": LEDGER_SERVICE_ID},
+    )
+    response.raise_for_status()
+    entries = sorted(response.json()["data"], key=lambda e: e["id"])
+    for stale in entries[:-1]:
+        requests.delete(f"{INSTANCE_URL}/api/obj/analysis/{stale['id']}", headers=header).raise_for_status()
+
 
 
 def get_new_comments(
@@ -249,68 +347,12 @@ def comment_back(job: RescanJob, message: str) -> None:
     response = requests.post(
         f"{INSTANCE_URL}/api/sources/{job.source_id}/comments",
         json={
-            "text": f"№{job.job_id}:{str_to_varsel_str(job.serialize())} {message} @{job.author}",
+            "text": f"{message} @{job.author}",
             #"group_ids": SKYPORTAL_GROUP_IDS_FILTER,
         },
         headers=header,
     )
     response.raise_for_status()
-
-
-def job_from_comment(comment: str) -> Optional[RescanJob]:
-    """
-    Parse the hidden serialized job from a bot comment, if any.
-    """
-    text1 = comment.split(":")
-    if len(text1) < 2:
-        return None
-    text2 = text1[1].split(" ")[0]
-    if not text2.strip():
-        return None
-    text = varsel_str_to_str(text2)
-    try:
-        return RescanJob.deserialize(text)
-    except Exception:
-        traceback.print_exc()
-        return None
-
-
-def find_files_in_comments(comments: List[dict], source_id: str) -> Tuple[List[str], List[str]]:
-    """
-    Scan an already-fetched comment list (unbounded by the polling window) and
-    accumulate the processed/failed file ledger across *every* bot reply found
-    for this source, from every job -- union, not "trust the most recent one".
-
-    This is deliberately robust against two ways a single latest-wins approach
-    breaks: (a) diagnostic-only jobs (help/dump/show/unrecognized/bare-disallow)
-    reach a terminal stage without ever touching processed_files/failed_files --
-    if one of those happened to be the most recent reply, trusting it alone would
-    silently wipe out a real ledger; with a union they just contribute nothing
-    (empty set). (b) explicit-command jobs now run concurrently alongside an
-    active rescan for the same source, so completions for one source can
-    interleave -- a union combines them instead of letting one overwrite another.
-    Real per-file results are always safe to include regardless of a job's own
-    final stage (1000 success or 1001 mid-run crash): whatever made it into a
-    job's processed_files/failed_files reflects a StdWeb outcome that actually
-    happened and must never be silently forgotten. If the same file ever shows
-    up as both processed and failed across different jobs, success wins -- it's
-    removed from the failed set before returning.
-
-    Returns ([], []) if this source has never had a rescan reply. Pure function,
-    no I/O -- pipeline_tick's stage 1 fetches the comments once and reuses them here.
-    """
-    processed = set()
-    failed = set()
-    for comment in comments:
-        if not comment["bot"] or not comment["text"] or comment["text"][0] != "№":
-            continue
-        job = job_from_comment(comment["text"])
-        if job is None or job.source_id != source_id:
-            continue
-        processed.update(job.processed_files)
-        failed.update(job.failed_files)
-    failed -= processed
-    return list(processed), list(failed)
 
 
 def owncloud_exists(path: str) -> bool:
@@ -454,7 +496,7 @@ def pipeline_tick(job: RescanJob) -> bool:
     silent unless it finds something worth reporting: new files, a failure, or
     the triggering comment itself mentions "owncloud"/"upload" (in which case a
     "nothing new" reply is sent too, so a human who says they uploaded something
-    gets confirmation either way). Explicit "{SKYPORTAL_COMMAND}help/dump/show"
+    gets confirmation either way). Explicit "{SKYPORTAL_COMMAND}help/dump"
     commands always reply.
 
     Flow (labelled by job.stage):
@@ -462,7 +504,8 @@ def pipeline_tick(job: RescanJob) -> bool:
        silently if it's bot-authored (this is the only bot check anywhere --
        get_new_comments doesn't inspect comment content at all) or was deleted,
        parse an explicit command if the comment mentions one, and restore the
-       processed/failed files from the same fetch
+       processed/failed file ledger (see restore_ledger -- a dedicated Analysis
+       Service entry per source, not decoded from past comments)
     2. List the entire OwnCloud source directory (recursively) and diff it against the files
     3. Create a StdWeb task per unprocessed file and drive each through
        create/upload/start/poll, then upload the result to SkyPortal (each file's
@@ -496,7 +539,7 @@ def pipeline_tick(job: RescanJob) -> bool:
             if SKYPORTAL_COMMAND in job.comment:
                 command = job.comment.split(SKYPORTAL_COMMAND)[1]
                 argv = command.split(" ")
-                help_message = f"Usage: any comment triggers a rescan of this source's OwnCloud directory. Feedback is silent unless new files are found (or fail), or your comment mentions 'owncloud'/'upload'.\nExplicit commands (no space before the keyword):\n{SKYPORTAL_COMMAND}help\n{SKYPORTAL_COMMAND}dump [limit]\n{SKYPORTAL_COMMAND}show <invisible text>."
+                help_message = f"Usage: any comment triggers a rescan of this source's OwnCloud directory. Feedback is silent unless new files are found (or fail), or your comment mentions 'owncloud'/'upload'.\nExplicit commands (no space before the keyword):\n{SKYPORTAL_COMMAND}help\n{SKYPORTAL_COMMAND}dump [limit]."
                 if argv[0]:
                     # This is a special command
                     if argv[0] == "help":
@@ -509,18 +552,6 @@ def pipeline_tick(job: RescanJob) -> bool:
                         if len(argv) > 1 and argv[1].isdigit():
                             count = min(len(pipeline), int(argv[1]))
                         comment_back(job, "\n"+"\n".join(map(lambda j: j.serialize(), pipeline[0:count])))
-                        return True
-                    if argv[0] == "show":
-                        job.stage = 1000
-                        count = 100
-                        if len(argv) > 1:
-                            if argv[1].isdigit():
-                                count = int(argv[1])
-                            else:
-                                decoded = varsel_str_to_str("".join(filter(lambda x: 0xfe00 <= ord(x) <= 0xfe0f, command)))
-                                comment_back(job, decoded)
-                                return True
-                        comment_back(job, "TODO, for now you have to give №x: .")
                         return True
                     job.stage = 1001
                     comment_back(job, f"Unrecognized command. {help_message}")
@@ -540,7 +571,7 @@ def pipeline_tick(job: RescanJob) -> bool:
                     return True
                 # "@rescan" mentioned within other text: proceed to a silent rescan.
 
-            job.processed_files, job.failed_files = find_files_in_comments(comments, job.source_id)
+            job.processed_files, job.failed_files, job.file_details = restore_ledger(job.source_id)
             job.stage = 2
 
         if job.stage <= 2:
@@ -607,11 +638,13 @@ def pipeline_tick(job: RescanJob) -> bool:
                             raise RuntimeError(f"SkyPortal upload failed: {e} ({task_link})")
                         file_job.stage = 1000
                         job.processed_files.append(file_job.path)
+                        job.file_details[file_job.path] = {"stdweb_id": file_job.stdweb_id, "status": "processed"}
                         newly_done.append(file_job)
                 except Exception as e:
                     file_job.stage = 1001
                     file_job.error = str(e)
                     job.failed_files.append(file_job.path)
+                    job.file_details[file_job.path] = {"stdweb_id": file_job.stdweb_id, "status": "failed", "error": file_job.error}
                     newly_failed.append(file_job)
 
             if newly_done or newly_failed:
@@ -621,6 +654,7 @@ def pipeline_tick(job: RescanJob) -> bool:
                 if newly_failed:
                     parts.append(f"{len(newly_failed)} failed: {', '.join(f.path.split('/')[-1] for f in newly_failed)}")
                 comment_back(job, "; ".join(parts) + ".")
+                save_ledger(job)
 
             if all(file_job.stage >= 1000 for file_job in job.file_jobs):
                 job.stage = 1000
@@ -772,6 +806,12 @@ if __name__ == "__main__":
         )
         exit(1)
     header = {"Authorization": f"token {SKYPORTAL_TOKEN}"}
+
+    try:
+        LEDGER_SERVICE_ID = get_or_create_ledger_service()
+    except Exception as e:
+        logger.error(f"Could not find or create the {LEDGER_SERVICE_NAME!r} analysis service: {e}")
+        exit(1)
 
     # Parse start time from environment variable
     start_time_str = os.getenv("START_TIME")
