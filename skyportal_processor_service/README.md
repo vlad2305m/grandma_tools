@@ -8,15 +8,17 @@ the result back to the SkyPortal source as a photometry point.
 
 * Polls SkyPortal for new comments (`comment_watcher.py`); any non-bot comment
   on a source triggers a check, no special command required.
-* Recursively scans the source's OwnCloud folder for new FITS files.
+* Recursively scans the source's OwnCloud folder for new FITS files, checking
+  each one against a per-source processed/failed file ledger (see "File
+  ledger" below) so already-handled files are never redone.
 * Drives StdWeb (create task, upload/point at the file, run `inspect` +
   `photometry`, poll to completion) for each new file found.
 * Uploads the resulting forced photometry (mag/magerr/limiting magnitude,
   filter, mjd) to the SkyPortal source via StdWeb's
   `POST /api/tasks/{id}/skyportal/` endpoint, then replies on the comment
   thread with the outcome.
-* Explicit `@rescanhelp` / `@rescandump` / `@rescanshow` commands for
-  inspecting/debugging the in-flight job ledger.
+* Explicit `@rescanhelp` / `@rescandump` commands for inspecting/debugging
+  the in-flight job pipeline.
 
 ## Dependencies
 
@@ -48,6 +50,38 @@ See `.env.default` for the full list of environment variables. Notably:
   `SKYPORTAL_TOKEN`/`SKYPORTAL_BASE_URL` configured (StdWeb performs the
   SkyPortal upload itself, using its own credentials -- see
   `stdweb/REST_API.md`).
+
+## File ledger
+
+Each source's processed/failed file ledger (which OwnCloud files have already
+been turned into a StdWeb task and, if successful, uploaded to SkyPortal) is
+stored as a SkyPortal [Analysis](https://skyportal.io/docs/analysis.html)
+entry (`upload_only`, never shown on the source page), not in the comment
+thread -- see `get_or_create_ledger_service`/`restore_ledger`/`save_ledger` in
+`comment_watcher.py`. Every ledger save replaces the source's previous entry
+(prunes it after uploading the new one), so there's always exactly one, and
+restoring on restart/rescan just reads it back -- this assumes only one
+instance of this service runs against a given SkyPortal instance at a time.
+
+On first run against a SkyPortal instance, the service needs to find or
+create an Analysis Service named `grandma_file_processing_ledger`. Finding it
+only needs an ordinary token; **creating** it needs the "Manage Analysis
+Services" ACL, which a normal service token won't have (it only needs "Run
+Analyses" for everything else this service does, including uploading/
+reading/deleting ledger entries). If the service doesn't exist yet and
+`SKYPORTAL_TOKEN` can't create it, startup fails with the exact JSON payload
+an admin needs to `POST` once to `/api/analysis_service` (with their own,
+more privileged token) -- after that, restart this service and it'll find it
+by name every time.
+
+Set `GROUP_IDS` so ledger entries are visible to/readable by `SKYPORTAL_TOKEN`
+regardless of its own personal group memberships: entries are explicitly
+shared with those groups on upload. Without it, visibility falls back to
+`SKYPORTAL_TOKEN`'s own accessible groups at upload time, which is fine for a
+token that's an actual member of a relevant group but silently produces an
+unreadable, orphaned ledger entry for a token with none (comment polling and
+posting don't have this problem -- SkyPortal grants broader read access to
+public/discoverable groups there than to arbitrary rows like an Analysis).
 
 ## Testing policy: OwnCloud is read-only, always
 

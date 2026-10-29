@@ -13,7 +13,7 @@ from playwright.sync_api import sync_playwright
 load_dotenv("../.env")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from comment_watcher import job_from_comment  # noqa: E402
+from comment_watcher import LEDGER_SERVICE_NAME  # noqa: E402
 
 # OwnCloud's on-disk data directory, as bind-mounted by docker-compose.yaml --
 # tests seed fixture files by writing here directly (see seed_owncloud_file
@@ -98,6 +98,38 @@ def get_comments():
     return response.json()["data"]
 
 
+def get_ledger(source_id):
+    """
+    Fetch the current processed/failed file ledger for a source directly from
+    the Analysis Service comment_watcher.py persists it in (see
+    save_ledger/restore_ledger in comment_watcher.py) -- replaces decoding it
+    out of a bot reply comment.
+    """
+    response = requests.get(f"{SKYPORTAL_URL}/api/analysis_service", headers=SKYPORTAL_HEADERS)
+    response.raise_for_status()
+    service_id = next(
+        s["id"] for s in response.json()["data"] if s["name"] == LEDGER_SERVICE_NAME
+    )
+
+    response = requests.get(
+        f"{SKYPORTAL_URL}/api/obj/{source_id}/analysis",
+        headers=SKYPORTAL_HEADERS,
+        params={"analysisServiceID": service_id},
+    )
+    response.raise_for_status()
+    entries = response.json()["data"]
+    assert entries, f"No ledger entry for {source_id}"
+    latest_id = max(e["id"] for e in entries)
+
+    response = requests.get(
+        f"{SKYPORTAL_URL}/api/obj/analysis/{latest_id}",
+        headers=SKYPORTAL_HEADERS,
+        params={"includeAnalysisData": True},
+    )
+    response.raise_for_status()
+    return response.json()["data"]["data"]["results"]["data"]
+
+
 @pytest.fixture(scope="module", autouse=True)
 def seed_source_and_file():
     """Real SkyPortal source at the fixture's coordinates, with the fixture FITS
@@ -172,14 +204,16 @@ def test_comment_triggers_rescan_and_photometry():
     assert "1 new file(s) processed and uploaded to SkyPortal" in reply["text"], reply["text"]
     assert "0 new file(s) failed" in reply["text"], reply["text"]
 
-    job = job_from_comment(reply["text"])
-    assert job is not None, f"Could not decode job ledger from reply: {reply['text']!r}"
-    assert len(job.file_jobs) == 1, job.file_jobs
-    file_job = job.file_jobs[0]
-    assert file_job.stage == 1000, f"File job did not reach done stage: {file_job}"
+    file_path = f"{SOURCE_ID}/{TELESCOPE_FOLDER}/test_image.fits"
+    ledger = get_ledger(SOURCE_ID)
+    assert ledger["processed_files"] == [file_path], ledger
+    assert ledger["failed_files"] == [], ledger
+    file_detail = ledger["file_details"].get(file_path)
+    assert file_detail is not None and file_detail["status"] == "processed", ledger
+    stdweb_id = file_detail["stdweb_id"]
 
     final_state = wait_for_task_state(
-        file_job.stdweb_id, {"photometry_done", "failed"}
+        stdweb_id, {"photometry_done", "failed"}
     )
     assert final_state == "photometry_done"
 
@@ -191,5 +225,5 @@ def test_comment_triggers_rescan_and_photometry():
     )
     response.raise_for_status()
     photometry = response.json()["data"]
-    matching = [p for p in photometry if p.get("origin") == f"stdweb:{file_job.stdweb_id}"]
-    assert matching, f"No SkyPortal photometry point with origin stdweb:{file_job.stdweb_id}"
+    matching = [p for p in photometry if p.get("origin") == f"stdweb:{stdweb_id}"]
+    assert matching, f"No SkyPortal photometry point with origin stdweb:{stdweb_id}"
