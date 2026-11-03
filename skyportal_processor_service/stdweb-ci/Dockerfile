@@ -5,10 +5,11 @@ FROM python:3.12-slim
 # Astrometry.Net (PSF photometry, stacking, subtraction, blind WCS solving)
 # are intentionally omitted here -- see doc/installation.rst for those.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        sextractor \
+        source-extractor \
         scamp \
         gcc \
         libcfitsio-dev \
+        libmagic1t64 \
         git \
         redis-server \
     && rm -rf /var/lib/apt/lists/*
