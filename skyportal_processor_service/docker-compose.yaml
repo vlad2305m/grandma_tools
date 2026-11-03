@@ -105,7 +105,10 @@ services:
   # redis://localhost/ with no env override, so redis + the celery worker +
   # the Django dev server all have to share one network namespace. Its own
   # SQLite db and DATA_PATH/TASKS_PATH are ephemeral container-local state,
-  # which is fine for a CI run (see stdweb/docker-entrypoint.sh).
+  # which is fine for a CI run. Upstream stdweb (karpov-sv/stdweb) has no
+  # Dockerfile of its own -- see stdweb-ci/README.md; local dev needs one
+  # copied (or symlinked) into its own stdweb checkout the same way CI's
+  # "Prepare StdWeb Docker build files" step does.
   stdweb:
     build:
       # Local dev: grandma_tools/ and stdweb/ are sibling checkouts, two
@@ -113,7 +116,6 @@ services:
       # root and stdweb alongside it (one level up) -- override via
       # STDWEB_PATH=../stdweb there. See skyportal_processor_service_ci.yaml.
       context: ${STDWEB_PATH:-../../stdweb}
-    image: stdweb-ci
     container_name: stdweb-web
     ports:
       - "8000:8000"
