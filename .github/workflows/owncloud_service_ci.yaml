@@ -56,10 +56,10 @@ jobs:
       run: |
         cd skyportal
         echo "Creating database tables..."
-        docker exec skyportal-web bash -c 'source /skyportal_env/bin/activate && FLAGS="--config=config.yaml" make db_create_tables'
+        docker exec skyportal-web bash -c 'source /skyportal/.venv/bin/activate && FLAGS="--config=config.yaml" make db_create_tables'
         
         echo "Loading demo data..."
-        docker exec skyportal-web bash -c 'source /skyportal_env/bin/activate && FLAGS="--create_tables --config=config.yaml" make load_demo_data'
+        docker exec skyportal-web bash -c 'source /skyportal/.venv/bin/activate && FLAGS="--create_tables --config=config.yaml" make load_demo_data'
         echo "Database initialized successfully"
         
     - name: Extract SkyPortal token
