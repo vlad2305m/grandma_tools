@@ -28,10 +28,8 @@ env:
   TELESCOPE_INSTRUMENT_MAP: '{"TAROT-TCA": "TAROT Calern"}'
   START_TIME: "2017-06-01T00:00:00Z"
 
-  # Checked out and built alongside grandma_tools; see the "Checkout StdWeb" step.
-  # NOTE: this ref must exist and be pushed to vlad2305m/stdweb for the workflow
-  # to resolve it -- see the repo's session notes if it 404s.
-  STDWEB_REF: "fix/stacking_task_path"
+  # Checked out (upstream, not a fork -- see the "Checkout StdWeb" step) and
+  # built alongside grandma_tools.
   STDWEB_USERNAME: "stdweb-ci"
   STDWEB_PASSWORD: "stdweb-ci-password-not-used-in-prod"
 
@@ -53,10 +51,18 @@ jobs:
     - name: Checkout StdWeb
       uses: actions/checkout@v4
       with:
-        repository: vlad2305m/stdweb
-        ref: ${{ env.STDWEB_REF }}
+        repository: karpov-sv/stdweb
         path: stdweb
         submodules: recursive
+
+    - name: Prepare StdWeb Docker build files
+      run: |
+        # Upstream stdweb has no Dockerfile of its own -- see
+        # skyportal_processor_service/stdweb-ci/README.md for why these are
+        # grandma_tools' own files, copied in rather than living upstream.
+        cp skyportal_processor_service/stdweb-ci/Dockerfile stdweb/Dockerfile
+        cp skyportal_processor_service/stdweb-ci/docker-entrypoint.sh stdweb/docker-entrypoint.sh
+        cp skyportal_processor_service/stdweb-ci/.dockerignore stdweb/.dockerignore
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
