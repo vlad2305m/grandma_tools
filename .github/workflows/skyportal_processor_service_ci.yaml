@@ -6,7 +6,11 @@ on:
   pull_request:
 
 env:
-  OWNCLOUD_BASE_URL: "http://localhost:8080/remote.php/dav/files"
+  # comment_watcher.py appends /remote.php/dav/files/{user}/{path} itself
+  # (see its own default BASE_URL fallback, which is also bare) -- a
+  # pre-suffixed value here doubles the path and 404s every OwnCloud
+  # PROPFIND/GET it makes.
+  OWNCLOUD_BASE_URL: "http://localhost:8080"
   OWNCLOUD_USERNAME: "admin"
   OWNCLOUD_TOKEN: "admin"
   OWNCLOUD_USER_ID: "admin"
@@ -67,6 +71,27 @@ jobs:
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
+    - name: Create SkyPortal test config
+      run: |
+        # docker.yaml (committed upstream) already has the right
+        # container-to-container database.host/password for this compose
+        # setup -- the Dockerfile copies it to config.yaml (`cp docker.yaml
+        # config.yaml`) before `make system_setup` runs. Merging explicitly
+        # here too removes any doubt rather than relying on that alone.
+        pip install --break-system-packages --quiet pyyaml
+        python3 -c "
+        import yaml
+        path = 'skyportal/docker.yaml'
+        with open(path) as f:
+            cfg = yaml.safe_load(f)
+        cfg.setdefault('database', {})['host'] = 'db'
+        cfg['database']['password'] = 'password'
+        with open(path, 'w') as f:
+            yaml.safe_dump(cfg, f)
+        "
+        echo "Updated docker.yaml:"
+        cat skyportal/docker.yaml
+
     - name: Build SkyPortal Docker images
       run: |
         cd skyportal
@@ -78,6 +103,12 @@ jobs:
       env:
         STDWEB_PATH: ../stdweb
       run: |
+        # docker-compose.yaml's `web` depends on `db-init` (which creates
+        # the schema) completing successfully, which itself depends on
+        # `db`'s healthcheck -- `docker compose up` always waits out that
+        # whole dependency chain before starting `web`, `-d` or not, so by
+        # the time this step returns, `web` never raced an empty schema at
+        # all (mirrors upstream skyportal's own docker-compose.yaml).
         cd skyportal_processor_service
         echo "Starting services..."
         docker compose up -d --build
@@ -90,13 +121,12 @@ jobs:
 
     - name: Wait for SkyPortal to be ready
       run: |
-        # db_create_tables talks straight to Postgres and can succeed before
-        # the app server itself is actually accepting requests -- supervisor
-        # starts ~39 services (migration check, 4 app workers, nginx, rspack,
-        # ...) on container start, which can take a while. load_demo_data
-        # needs the HTTP API and gives up after a fixed number of retries
-        # (tools/data_loader.py), so without this wait it can fail outright
-        # on a slow-to-start container rather than just running late.
+        # Supervisor starts ~39 services (migration check, 4 app workers,
+        # nginx, rspack, ...) on container start, which can take a while.
+        # load_demo_data needs the HTTP API and gives up after a fixed
+        # number of retries (tools/data_loader.py), so without this wait it
+        # can fail outright on a slow-to-start container rather than just
+        # running late.
         echo "Waiting for SkyPortal (migration + app workers + nginx) to come up..."
         timeout 300 bash -c 'until curl -sf http://localhost:9000/api/sysinfo > /dev/null; do sleep 3; done'
         echo "SkyPortal is up"
@@ -124,12 +154,9 @@ jobs:
 
         echo "STDWEB_TOKEN=$STDWEB_TOKEN" >> $GITHUB_OUTPUT
 
-    - name: Initialize SkyPortal database
+    - name: Load SkyPortal demo data
       run: |
         cd skyportal
-        echo "Creating database tables..."
-        docker exec skyportal-web bash -c 'source /skyportal/.venv/bin/activate && FLAGS="--config=config.yaml" make db_create_tables'
-
         echo "Loading demo data..."
         docker exec skyportal-web bash -c 'source /skyportal/.venv/bin/activate && FLAGS="--create_tables --config=config.yaml" make load_demo_data'
         echo "Database initialized successfully"
@@ -148,6 +175,43 @@ jobs:
 
         echo "SKYPORTAL_TOKEN=$SKYPORTAL_TOKEN" >> $GITHUB_OUTPUT
 
+    - name: Create second SkyPortal user
+      id: create_poster_user
+      run: |
+        # comment_watcher.py filters out comments authored by its own user id
+        # (SELF_USER_ID), not by SkyPortal's bot flag -- every token-authenticated
+        # request is bot=True regardless of which token (see
+        # skyportal/handlers/api/comment.py), so triggering it needs a token
+        # belonging to a genuinely different user. Plain API calls (POST
+        # /api/user, then /api/internal/tokens for that user) replace what
+        # previously needed a real Playwright browser session logged in via
+        # SkyPortal's debug-login OAuth stand-in.
+        SKYPORTAL_TOKEN="${{ steps.extract_skyportal_token.outputs.SKYPORTAL_TOKEN }}"
+
+        USER_ID=$(curl -sf -X POST http://localhost:9000/api/user \
+          -H "Authorization: token $SKYPORTAL_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d '{"username": "ci-poster", "groupIDsAndAdmin": [[1, true]]}' \
+          | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['id'])")
+
+        if [ -z "$USER_ID" ]; then
+          echo "Failed to create second SkyPortal user"
+          exit 1
+        fi
+
+        POSTER_TOKEN=$(curl -sf -X POST http://localhost:9000/api/internal/tokens \
+          -H "Authorization: token $SKYPORTAL_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "{\"user_id\": $USER_ID, \"acls\": [\"Comment\"], \"name\": \"ci-poster-token\"}" \
+          | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['token_id'])")
+
+        if [ -z "$POSTER_TOKEN" ]; then
+          echo "Failed to create token for second SkyPortal user"
+          exit 1
+        fi
+
+        echo "SKYPORTAL_POSTER_TOKEN=$POSTER_TOKEN" >> $GITHUB_OUTPUT
+
     - name: Create test environment file
       run: |
         cd skyportal_processor_service
@@ -163,6 +227,7 @@ jobs:
         # SkyPortal Configuration
         SKYPORTAL_URL=http://localhost:9000
         SKYPORTAL_TOKEN=${{ steps.extract_skyportal_token.outputs.SKYPORTAL_TOKEN }}
+        SKYPORTAL_POSTER_TOKEN=${{ steps.create_poster_user.outputs.SKYPORTAL_POSTER_TOKEN }}
 
         # StdWeb Configuration
         STDWEB_URL=http://localhost:8000
@@ -183,15 +248,9 @@ jobs:
       run: |
         cd skyportal_processor_service
         echo "Installing comment watcher dependencies."
-        pip install -r requirements.txt
-
-    - name: Install Playwright browser
-      run: |
-        # test_integration_comment_watcher.py drives a real headless browser to
-        # post a non-bot comment -- SkyPortal marks any token-authenticated
-        # request as bot=True (see skyportal/handlers/api/comment.py), so a
-        # plain `requests` POST can never trigger comment_watcher.py at all.
-        python -m playwright install --with-deps chromium
+        # Runner's system Python is PEP 668 externally-managed; this is a
+        # disposable CI runner, not a system to protect from pip.
+        pip install --break-system-packages -r requirements.txt
 
     - name: Test comment watcher startup
       run: |

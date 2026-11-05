@@ -344,16 +344,17 @@ def get_new_comments(
 
     Every other (bare or content-free) comment goes through coalescing: at most
     one job stub is created per source per call -- if a source gets several such
-    comments in one tick, only the latest *non-bot* comment is used (bot replies
-    always outrank the human comment that spawned them by id, so they'd otherwise
-    win and silently swallow the real trigger); if a job for that source is
-    already running (in `pipeline`), no job is created at all -- the latest
-    comment id is queued in `pending_rerun` and fired the instant the active job
-    finishes (see pipeline_tick_all), not on the next poll.
+    comments in one tick, only the latest *non-self-bot-reply* comment is used
+    (this service's own replies always outrank the human comment that spawned
+    them by id, so they'd otherwise win and silently swallow the real
+    trigger); if a job for that source is already running (in `pipeline`), no
+    job is created at all -- the latest comment id is queued in
+    `pending_rerun` and fired the instant the active job finishes (see
+    pipeline_tick_all), not on the next poll.
 
-    Bot exclusion and explicit-command detection here are purely structural
-    (scheduling/routing only); actual command execution and files-restore are
-    entirely pipeline_tick's stage 1 ("get the comments").
+    Self-bot-reply exclusion and explicit-command detection here are purely
+    structural (scheduling/routing only); actual command execution and
+    files-restore are entirely pipeline_tick's stage 1 ("get the comments").
 
     Updates the last_iteration timestamp before making the API call to ensure
     no comments are missed between polling cycles. Only considers comments that
@@ -392,7 +393,11 @@ def get_new_comments(
         seen_comments_for_source = seen_comments[source["id"]]
 
         for comment in source["comments"]:
-            if comment.get("bot") is not False:  # Skip bots
+            if comment.get("author_id") == SELF_USER_ID and comment.get("bot") is not False:
+                # Skip only this service's own *bot* replies (missing/null bot flag
+                # treated conservatively as bot too) -- the admin user behind
+                # SELF_USER_ID can still trigger a rescan with a real (non-bot,
+                # e.g. UI-posted) comment of their own.
                 continue
             if comment["created_at"] in seen_comments_for_source:
                 continue
@@ -595,8 +600,9 @@ def pipeline_tick(job: RescanJob) -> bool:
 
     Flow (labelled by job.stage):
     1. Get the comments (one API call): find the trigger comment, bail out
-       silently if it's bot-authored (this is the only bot check anywhere --
-       get_new_comments doesn't inspect comment content at all) or was deleted,
+       silently if it's this service's own bot reply (see get_new_comments and
+       the author_id == SELF_USER_ID and bot checks there and below) or was
+       deleted,
        parse an explicit command if the comment mentions one, and restore the
        processed/failed file ledger (see restore_ledger -- a dedicated Analysis
        Service entry per source, not decoded from past comments)
@@ -625,11 +631,17 @@ def pipeline_tick(job: RescanJob) -> bool:
                 comments = response.json()["data"]
 
                 trigger = next((c for c in comments if c["id"] == job.job_id), None)
-                if trigger is None or trigger.get("bot") is not False:
-                    # Comment vanished, or was bot-authored (missing/null bot flag treated
-                    # conservatively as bot too). Never legitimately reachable today since
-                    # get_new_comments doesn't filter by bot at all -- this check IS the
-                    # bot filter now, guarding against a self-triggering reply loop.
+                if trigger is None or (
+                    trigger.get("author_id") == SELF_USER_ID
+                    and trigger.get("bot") is not False
+                ):
+                    # Comment vanished, or is this service's own *bot* reply (missing/
+                    # null bot flag treated conservatively as bot too) -- a second,
+                    # independent check (get_new_comments already filters its own
+                    # bot replies out, but the trigger comment is re-fetched fresh
+                    # here since pipeline execution can lag behind polling), guarding
+                    # against a self-triggering reply loop while still letting the
+                    # admin user behind SELF_USER_ID trigger one with a real comment.
                     job.stage = 1000
                     return True
                 job.comment = trigger["text"]
@@ -981,6 +993,16 @@ if __name__ == "__main__":
         )
         exit(1)
     header = {"Authorization": f"token {SKYPORTAL_TOKEN}"}
+    # Used to recognize (and skip) this service's own *bot* reply comments,
+    # so it never reacts to itself -- see get_new_comments/pipeline_tick's
+    # "author_id == SELF_USER_ID and bot" checks. The admin user behind this
+    # token can still trigger a rescan with a real (non-bot) comment of their
+    # own; only automated replies posted under this same identity are
+    # excluded. Resolved once at startup rather than hardcoded so
+    # SKYPORTAL_TOKEN alone determines identity.
+    response = requests.get(f"{INSTANCE_URL}/api/internal/profile", headers=header)
+    response.raise_for_status()
+    SELF_USER_ID = response.json()["data"]["id"]
 
     try:
         RESCAN_SERVICE_ID = get_or_create_rescan_service()
