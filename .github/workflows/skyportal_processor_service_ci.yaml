@@ -300,6 +300,20 @@ jobs:
 
         echo "Comment watcher startup test completed successfully -- leaving it running for the integration test"
 
+    - name: Fix OwnCloud data directory permissions
+      run: |
+        # OwnCloud's container provisions its bind-mounted data directory
+        # (docker-compose.yaml's ./data/owncloud) as its own internal
+        # container user (uid 33/www-data), with directory permissions
+        # (e.g. drwxrwx---) that exclude the runner's own user entirely.
+        # seed_owncloud_file() in the integration test writes fixture
+        # files directly into this tree from plain Python running as the
+        # runner user (see its own docstring for why), so it needs write
+        # access -- granted here rather than in docker-compose.yaml since
+        # the restrictive permissions are OwnCloud's own default and come
+        # from inside the container, not something compose config controls.
+        sudo chmod -R a+rwX skyportal_processor_service/data/owncloud
+
     - name: Run comment watcher integration test
       run: |
         cd skyportal_processor_service/tests
