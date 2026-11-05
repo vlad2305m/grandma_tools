@@ -18,8 +18,10 @@ services:
     ports:
       - 8080:8080
     depends_on:
-      - mariadb
-      - redis
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       - OWNCLOUD_DOMAIN=localhost:8080
       - OWNCLOUD_TRUSTED_DOMAINS=localhost
@@ -87,6 +89,31 @@ services:
     volumes:
       - thumbnails:/skyportal/static/thumbnails:z
       - persistentdata:/skyportal/persistentdata:z
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+
+  # Mirrors upstream skyportal's own docker-compose.yaml: run_production
+  # does not create tables, so supervisor's app workers race straight into
+  # an empty schema the instant `web` boots (app_server.py's make_app
+  # raises "No tables found", and supervisor gives up retrying it --
+  # FATAL, permanent -- long before a separately-run `make db_create_tables`
+  # finishes). Running it here first and gating `web` on it finishing
+  # (`service_completed_successfully` below) means `web` never starts
+  # against an incomplete database at all. initial_setup.py's
+  # create_tables() is checkfirst=True, so this is a safe no-op on an
+  # already-populated database (e.g. a reused local bind mount).
+  db-init:
+    image: skyportal/web
+    command:
+      [
+        "bash",
+        "-c",
+        "source .venv/bin/activate && PYTHONPATH=. python skyportal/initial_setup.py --config=config.yaml",
+      ]
+    depends_on:
+      db:
+        condition: service_healthy
 
   db:
     # SkyPortal's summary_embeddings table needs pgvector's `vector` type
@@ -104,6 +131,11 @@ services:
     volumes:
       - ./data/dbdata:/var/lib/postgresql/data:z
     restart: on-failure:3
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U skyportal -d skyportal"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   # ---- StdWeb (photometry processing) ----
   # A single container: stdweb's settings.py hardcodes CELERY_BROKER_URL to
