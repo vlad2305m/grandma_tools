@@ -60,6 +60,26 @@ COMMENT_SOURCE_ID = f"{BASE_SOURCE_ID}-COMMENT"
 ANALYSIS_SOURCE_ID = f"{BASE_SOURCE_ID}-ANALYSIS"
 
 
+def sp_request(method, path, **kwargs):
+    """
+    requests.request against SkyPortal with 429 retry/backoff. Running both
+    tests below concurrently (see skyportal_processor_service_ci.yaml's
+    `pytest -n 2`) roughly doubles ordinary polling traffic against the one
+    SkyPortal instance, which is enough to trip its rate limiter on its own
+    -- not just under genuine abuse -- so a plain requests.get/post here
+    would otherwise make the whole run flaky. Callers still call
+    response.raise_for_status() themselves for any other error.
+    """
+    url = f"{SKYPORTAL_URL}{path}"
+    response = requests.request(method, url, **kwargs)
+    attempt = 0
+    while response.status_code == 429 and attempt < 5:
+        time.sleep(2 * (attempt + 1))
+        response = requests.request(method, url, **kwargs)
+        attempt += 1
+    return response
+
+
 def seed_owncloud_file(relative_path, fixture_path):
     """
     Place a file directly in OwnCloud's on-disk storage, bypassing OwnCloud's
@@ -99,8 +119,8 @@ def post_comment(source_id, text):
     SkyPortal user" in the CI workflow) specifically so this is a genuine
     plain API call, with no browser/UI involved at all.
     """
-    response = requests.post(
-        f"{SKYPORTAL_URL}/api/sources/{source_id}/comments",
+    response = sp_request(
+        "POST", f"/api/sources/{source_id}/comments",
         json={"text": text},
         headers=SKYPORTAL_POSTER_HEADERS,
     )
@@ -108,8 +128,8 @@ def post_comment(source_id, text):
 
 
 def get_comments(source_id):
-    response = requests.get(
-        f"{SKYPORTAL_URL}/api/sources/{source_id}/comments",
+    response = sp_request(
+        "GET", f"/api/sources/{source_id}/comments",
         headers=SKYPORTAL_HEADERS,
     )
     response.raise_for_status()
@@ -119,13 +139,13 @@ def get_comments(source_id):
 def self_user_id():
     """The user id behind SKYPORTAL_TOKEN -- comment_watcher.py's own
     SELF_USER_ID, resolved the same way (GET /api/internal/profile)."""
-    response = requests.get(f"{SKYPORTAL_URL}/api/internal/profile", headers=SKYPORTAL_HEADERS)
+    response = sp_request("GET", "/api/internal/profile", headers=SKYPORTAL_HEADERS)
     response.raise_for_status()
     return response.json()["data"]["id"]
 
 
 def get_service_id(name):
-    response = requests.get(f"{SKYPORTAL_URL}/api/analysis_service", headers=SKYPORTAL_HEADERS)
+    response = sp_request("GET", "/api/analysis_service", headers=SKYPORTAL_HEADERS)
     response.raise_for_status()
     return next(s["id"] for s in response.json()["data"] if s["name"] == name)
 
@@ -139,8 +159,8 @@ def get_ledger(source_id):
     completed entry" logic.
     """
     service_id = get_service_id(RESCAN_SERVICE_NAME)
-    response = requests.get(
-        f"{SKYPORTAL_URL}/api/obj/{source_id}/analysis",
+    response = sp_request(
+        "GET", f"/api/obj/{source_id}/analysis",
         headers=SKYPORTAL_HEADERS,
         params={"analysisServiceID": service_id},
     )
@@ -149,8 +169,8 @@ def get_ledger(source_id):
     assert completed, f"No completed ledger entry for {source_id}"
     latest_id = max(e["id"] for e in completed)
 
-    response = requests.get(
-        f"{SKYPORTAL_URL}/api/obj/analysis/{latest_id}",
+    response = sp_request(
+        "GET", f"/api/obj/analysis/{latest_id}",
         headers=SKYPORTAL_HEADERS,
         params={"includeAnalysisData": True},
     )
@@ -164,8 +184,8 @@ def seed_sources_and_files():
     TEST_SOURCE_SUFFIXES entry), each with the fixture FITS already sitting
     in the OwnCloud folder comment_watcher.py scans for it."""
     for source_id in (COMMENT_SOURCE_ID, ANALYSIS_SOURCE_ID):
-        response = requests.post(
-            f"{SKYPORTAL_URL}/api/sources",
+        response = sp_request(
+            "POST", "/api/sources",
             json={"id": source_id, "ra": FIXTURE_RA, "dec": FIXTURE_DEC, "group_ids": [1]},
             headers=SKYPORTAL_HEADERS,
         )
@@ -175,9 +195,7 @@ def seed_sources_and_files():
             # both sources regardless of which test it actually runs -- so
             # two workers can race to insert the same new source id. Treat
             # "already exists" as success rather than a real failure.
-            check = requests.get(
-                f"{SKYPORTAL_URL}/api/sources/{source_id}", headers=SKYPORTAL_HEADERS
-            )
+            check = sp_request("GET", f"/api/sources/{source_id}", headers=SKYPORTAL_HEADERS)
             if check.status_code == 200:
                 continue
         response.raise_for_status()
@@ -221,8 +239,8 @@ def wait_for_analysis_completion(source_id, service_id, after_id=0, timeout=240,
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
-        response = requests.get(
-            f"{SKYPORTAL_URL}/api/obj/{source_id}/analysis",
+        response = sp_request(
+            "GET", f"/api/obj/{source_id}/analysis",
             headers=SKYPORTAL_HEADERS,
             params={"analysisServiceID": service_id},
         )
@@ -269,8 +287,8 @@ def assert_file_processed(source_id):
     final_state = wait_for_task_state(stdweb_id, {"photometry_done", "failed"})
     assert final_state == "photometry_done"
 
-    response = requests.get(
-        f"{SKYPORTAL_URL}/api/sources/{source_id}/photometry", headers=SKYPORTAL_HEADERS
+    response = sp_request(
+        "GET", f"/api/sources/{source_id}/photometry", headers=SKYPORTAL_HEADERS
     )
     response.raise_for_status()
     photometry = response.json()["data"]
@@ -324,16 +342,16 @@ def test_analysis_triggers_rescan_and_photometry():
         pytest.skip("WEBHOOK_URL not configured -- analysis-triggered path is inactive")
 
     service_id = get_service_id(RESCAN_TRIGGER_SERVICE_NAME)
-    response = requests.get(
-        f"{SKYPORTAL_URL}/api/obj/{ANALYSIS_SOURCE_ID}/analysis",
+    response = sp_request(
+        "GET", f"/api/obj/{ANALYSIS_SOURCE_ID}/analysis",
         headers=SKYPORTAL_HEADERS,
         params={"analysisServiceID": service_id},
     )
     response.raise_for_status()
     before_id = max((e["id"] for e in response.json()["data"]), default=0)
 
-    response = requests.post(
-        f"{SKYPORTAL_URL}/api/obj/{ANALYSIS_SOURCE_ID}/analysis/{service_id}",
+    response = sp_request(
+        "POST", f"/api/obj/{ANALYSIS_SOURCE_ID}/analysis/{service_id}",
         json={},
         headers=SKYPORTAL_HEADERS,
     )
