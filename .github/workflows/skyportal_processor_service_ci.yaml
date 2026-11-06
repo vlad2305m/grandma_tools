@@ -1,0 +1,385 @@
+name: SkyPortal Processor Service CI/CD
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+env:
+  # comment_watcher.py appends /remote.php/dav/files/{user}/{path} itself
+  # (see its own default BASE_URL fallback, which is also bare) -- a
+  # pre-suffixed value here doubles the path and 404s every OwnCloud
+  # PROPFIND/GET it makes.
+  OWNCLOUD_BASE_URL: "http://localhost:8080"
+  OWNCLOUD_USERNAME: "admin"
+  OWNCLOUD_TOKEN: "admin"
+  OWNCLOUD_USER_ID: "admin"
+  # Only used by the test's standalone-run fallback now (the "Seed OwnCloud
+  # fixture file" step below places the fixture itself, via `docker cp`
+  # into the container, not this host path) -- kept for parity with
+  # test_integration_comment_watcher.py's own default.
+  OWNCLOUD_DATA_PATH: "../data/owncloud"
+
+  SAVE_PATH: "Candidates/Skyportal"
+  STDWEB_SAVE_PATH: ""
+  POLL_INTERVAL: "10"
+  GROUP_IDS: "1,2,3"
+  SOURCE_TAG: ""
+  SKYPORTAL_COMMAND: "@rescan"
+  # "TAROT Calern" is one of the fixed demo instruments make load_demo_data
+  # seeds every time -- matches the TAROT-TCA folder the integration test
+  # uploads its fixture FITS under.
+  TELESCOPE_INSTRUMENT_MAP: '{"TAROT-TCA": "TAROT Calern"}'
+  START_TIME: "2017-06-01T00:00:00Z"
+
+  # Checked out (upstream, not a fork -- see the "Checkout StdWeb" step) and
+  # built alongside grandma_tools.
+  STDWEB_USERNAME: "stdweb-ci"
+  STDWEB_PASSWORD: "stdweb-ci-password-not-used-in-prod"
+
+jobs:
+  integration-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Checkout SkyPortal
+      uses: actions/checkout@v4
+      with:
+        repository: skyportal/skyportal
+        path: skyportal
+        submodules: recursive
+
+    - name: Checkout StdWeb
+      uses: actions/checkout@v4
+      with:
+        repository: karpov-sv/stdweb
+        path: stdweb
+        submodules: recursive
+
+    - name: Prepare StdWeb Docker build files
+      run: |
+        # Upstream stdweb has no Dockerfile of its own -- see
+        # skyportal_processor_service/stdweb-ci/README.md for why these are
+        # grandma_tools' own files, copied in rather than living upstream.
+        cp skyportal_processor_service/stdweb-ci/Dockerfile stdweb/Dockerfile
+        cp skyportal_processor_service/stdweb-ci/docker-entrypoint.sh stdweb/docker-entrypoint.sh
+        cp skyportal_processor_service/stdweb-ci/.dockerignore stdweb/.dockerignore
+
+        # Adds the STDWEB_LOCAL_CATALOG_FILE escape hatch -- see
+        # stdweb-ci/README.md for why.
+        cd stdweb
+        git apply ../skyportal_processor_service/stdweb-ci/local_catalog.patch
+
+    - name: Patch SkyPortal docker.yaml for the externally-published port
+      run: |
+        # server.port is used only to build externally-facing URLs (e.g. the
+        # analysis webhook callback_url -- see get_app_base_url in
+        # skyportal/utils/app.py), not the actual internal bind (ports.app,
+        # left at 5000, matching nginx's real listen port). Default (5000)
+        # is wrong here: SkyPortal is reached from outside the container at
+        # 9000 (see docker-compose.yaml's "9000:5000" mapping), and
+        # comment_watcher.py -- which runs on the CI runner itself, not in
+        # the compose network -- needs a callback_url it can actually reach.
+        sed -i 's/^  port: 5000 # Internal port$/  port: 9000 # Externally-published port (see docker-compose.yaml'"'"'s 9000:5000 mapping)/' skyportal/docker.yaml
+        grep -A1 "^server:" skyportal/docker.yaml
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build SkyPortal Docker images
+      run: |
+        cd skyportal
+        echo "Building SkyPortal Docker images..."
+        make docker-local
+        echo "SkyPortal images built successfully"
+
+    - name: Start SkyPortal and OwnCloud
+      run: |
+        # --wait blocks until web's own healthcheck reports healthy
+        # (supervisor's ~39 services can take a while to actually start
+        # serving) -- no separate readiness polling needed; the schema-race
+        # avoidance itself is handled by db-init's own depends_on chain, see
+        # docker-compose.yaml.
+        #
+        # stdweb isn't started here: its SKYPORTAL_TOKEN (for its own direct
+        # PUT to SkyPortal) isn't known until SkyPortal's init runs below.
+        # Starting it once, later, with the token already set avoids a
+        # stop+recreate mid-run.
+        cd skyportal_processor_service
+        echo "Starting services..."
+        docker compose up -d --wait --build db db-init mariadb redis owncloud web
+        echo "SkyPortal is up"
+
+    - name: Load SkyPortal demo data
+      run: |
+        cd skyportal
+        echo "Loading demo data..."
+        docker exec skyportal-web bash -c 'source /skyportal/.venv/bin/activate && FLAGS="--create_tables --config=config.yaml" make load_demo_data'
+        echo "Database initialized successfully"
+
+    - name: Extract SkyPortal token
+      id: extract_skyportal_token
+      run: |
+        cd skyportal
+        echo "Extracting SkyPortal token..."
+        SKYPORTAL_TOKEN=$(docker exec skyportal-web cat .tokens.yaml | grep "INITIAL_ADMIN:" | cut -d':' -f2 | tr -d ' ')
+
+        if [ -z "$SKYPORTAL_TOKEN" ]; then
+          echo "Failed to extract SkyPortal token"
+          exit 1
+        fi
+
+        echo "SKYPORTAL_TOKEN=$SKYPORTAL_TOKEN" >> $GITHUB_OUTPUT
+
+    - name: Start StdWeb
+      env:
+        STDWEB_PATH: ../stdweb
+        STDWEB_LOCAL_CATALOG_FILE: /data/fixtures/ps1_cat.parquet
+        SKYPORTAL_TOKEN: ${{ steps.extract_skyportal_token.outputs.SKYPORTAL_TOKEN }}
+      run: |
+        # First start (not a restart): SKYPORTAL_TOKEN is already set, so
+        # StdWeb's own direct upload to SkyPortal works immediately. --wait
+        # blocks on its healthcheck (redis+celery+runserver all up) instead
+        # of a separate curl-polling step.
+        cd skyportal_processor_service
+        echo "Starting StdWeb..."
+        docker compose up -d --wait --build stdweb
+        echo "StdWeb is up"
+
+    - name: Create StdWeb superuser and API token
+      id: extract_stdweb_token
+      run: |
+        echo "Creating StdWeb superuser..."
+        docker exec stdweb-web python manage.py shell -c "
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        if not User.objects.filter(username='${{ env.STDWEB_USERNAME }}').exists():
+            User.objects.create_superuser('${{ env.STDWEB_USERNAME }}', 'ci@example.com', '${{ env.STDWEB_PASSWORD }}')
+        "
+
+        echo "Creating StdWeb API token..."
+        docker exec stdweb-web python manage.py drf_create_token ${{ env.STDWEB_USERNAME }} > token_output.txt
+        STDWEB_TOKEN=$(tail -1 token_output.txt | awk '{print $3}')
+
+        if [ -z "$STDWEB_TOKEN" ]; then
+          echo "Failed to extract StdWeb token"
+          cat token_output.txt
+          exit 1
+        fi
+
+        echo "STDWEB_TOKEN=$STDWEB_TOKEN" >> $GITHUB_OUTPUT
+
+    - name: Create second SkyPortal user
+      id: create_poster_user
+      run: |
+        # comment_watcher.py's self-reply filter excludes its own
+        # SELF_USER_ID, not SkyPortal's bot flag (every token-authenticated
+        # request is bot=True regardless of token) -- triggering it needs a
+        # token belonging to a genuinely different user. Note: previously
+        # needed a real Playwright/debug-login browser session for this;
+        # plain POST /api/user + /api/internal/tokens replaces it.
+        SKYPORTAL_TOKEN="${{ steps.extract_skyportal_token.outputs.SKYPORTAL_TOKEN }}"
+
+        # Retries + real status/body on failure. Note: a previous plain
+        # `curl -sf` failed silently here in CI (no server-side trace of the
+        # request at all), giving no signal why -- this makes a repeat
+        # failure debuggable and tolerates a transient hiccup.
+        api_post() {
+          for attempt in 1 2 3 4 5; do
+            HTTP_CODE=$(curl -s -o /tmp/api_response.json -w "%{http_code}" \
+              -X POST "http://localhost:9000$1" \
+              -H "Authorization: token $SKYPORTAL_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$2")
+            if [ "$HTTP_CODE" = "200" ]; then
+              return 0
+            fi
+            echo "Attempt $attempt: POST $1 returned HTTP $HTTP_CODE: $(cat /tmp/api_response.json)"
+            sleep 5
+          done
+          echo "Giving up on POST $1 after 5 attempts"
+          exit 1
+        }
+
+        api_post /api/user '{"username": "ci-poster", "groupIDsAndAdmin": [[1, true]]}'
+        USER_ID=$(python3 -c "import json; print(json.load(open('/tmp/api_response.json'))['data']['id'])")
+
+        api_post /api/internal/tokens "{\"user_id\": $USER_ID, \"acls\": [\"Comment\"], \"name\": \"ci-poster-token\"}"
+        POSTER_TOKEN=$(python3 -c "import json; print(json.load(open('/tmp/api_response.json'))['data']['token_id'])")
+
+        echo "SKYPORTAL_POSTER_TOKEN=$POSTER_TOKEN" >> $GITHUB_OUTPUT
+
+    - name: Create test environment file
+      run: |
+        cd skyportal_processor_service
+        echo "Creating test environment file."
+        cat > .env << EOF
+        # OwnCloud Configuration
+        OWNCLOUD_BASE_URL=${{ env.OWNCLOUD_BASE_URL }}
+        OWNCLOUD_USERNAME=${{ env.OWNCLOUD_USERNAME }}
+        OWNCLOUD_TOKEN=${{ env.OWNCLOUD_TOKEN }}
+        OWNCLOUD_USER_ID=${{ env.OWNCLOUD_USER_ID }}
+        OWNCLOUD_DATA_PATH=${{ env.OWNCLOUD_DATA_PATH }}
+
+        # SkyPortal Configuration
+        SKYPORTAL_URL=http://localhost:9000
+        SKYPORTAL_TOKEN=${{ steps.extract_skyportal_token.outputs.SKYPORTAL_TOKEN }}
+        SKYPORTAL_POSTER_TOKEN=${{ steps.create_poster_user.outputs.SKYPORTAL_POSTER_TOKEN }}
+
+        # StdWeb Configuration
+        STDWEB_URL=http://localhost:8000
+        STDWEB_TOKEN=${{ steps.extract_stdweb_token.outputs.STDWEB_TOKEN }}
+
+        # Application Settings
+        SAVE_PATH=${{ env.SAVE_PATH }}
+        STDWEB_SAVE_PATH=${{ env.STDWEB_SAVE_PATH }}
+        POLL_INTERVAL=${{ env.POLL_INTERVAL }}
+        GROUP_IDS=${{ env.GROUP_IDS }}
+        SOURCE_TAG=${{ env.SOURCE_TAG }}
+        SKYPORTAL_COMMAND=${{ env.SKYPORTAL_COMMAND }}
+        START_TIME=${{ env.START_TIME }}
+        # Activates the "Run Analysis" webhook trigger path (see
+        # test_analysis_triggers_rescan_and_photometry) -- comment_watcher.py
+        # runs on the runner itself, not in the compose network, so
+        # SkyPortal's container reaches back out to it via
+        # host.docker.internal (see docker-compose.yaml's web service).
+        WEBHOOK_URL=http://host.docker.internal:8765
+        EOF
+        echo "Environment file created"
+
+    - name: Install python dependencies
+      run: |
+        cd skyportal_processor_service
+        echo "Installing comment watcher dependencies."
+        # Runner's system Python is PEP 668 externally-managed; this is a
+        # disposable CI runner, not a system to protect from pip.
+        pip install --break-system-packages -r requirements.txt
+
+    - name: Test comment watcher startup
+      run: |
+        cd skyportal_processor_service
+        echo "Testing comment watcher startup (waiting for 'Listening for new sources...' or 60s timeout)..."
+
+        python comment_watcher.py --env-file .env > watcher.log 2>&1 &
+        WATCHER_PID=$!
+        echo "WATCHER_PID=$WATCHER_PID" >> $GITHUB_ENV
+
+        echo "Comment watcher started with PID: $WATCHER_PID"
+
+        TIMEOUT=60
+        ELAPSED=0
+        SUCCESS=false
+
+        while [ $ELAPSED -lt $TIMEOUT ]; do
+          if ! kill -0 $WATCHER_PID 2>/dev/null; then
+            echo "Comment watcher process has stopped unexpectedly"
+            cat watcher.log
+            exit 1
+          fi
+
+          if grep -q "Listening for new sources..." watcher.log 2>/dev/null; then
+            echo "Comment watcher is listening"
+            SUCCESS=true
+            break
+          fi
+
+          if grep -q "ERROR" watcher.log; then
+            echo "Error detected in comment watcher logs"
+            cat watcher.log
+            kill $WATCHER_PID 2>/dev/null || true
+            exit 1
+          fi
+
+          sleep 2
+          ELAPSED=$((ELAPSED + 2))
+        done
+
+        if [ "$SUCCESS" = false ]; then
+          echo "Timeout reached (60s) without seeing 'Listening for new sources...' log"
+          cat watcher.log
+          kill $WATCHER_PID 2>/dev/null || true
+          exit 1
+        fi
+
+        echo "Comment watcher startup test completed successfully -- leaving it running for the integration test"
+
+    - name: Seed OwnCloud fixture file
+      run: |
+        # docker cp talks to the Docker daemon directly, bypassing the
+        # bind-mounted data dir's host-side permissions entirely (OwnCloud
+        # owns it as uid 33/www-data). Note: previously seeded via a
+        # host-path write from Python + `sudo chmod -R a+rwX` on the whole
+        # tree. SOURCE_ID has to be known up front for the destination path,
+        # so it's generated here and exported as TEST_SOURCE_ID for the test
+        # to pick up; one source per trigger path under test (see
+        # TEST_SOURCE_SUFFIXES in test_integration_comment_watcher.py) so
+        # they don't share mutable state and can run concurrently.
+        TEST_SOURCE_ID="CIRESCANTEST$(openssl rand -hex 4)"
+        echo "TEST_SOURCE_ID=$TEST_SOURCE_ID" >> $GITHUB_ENV
+
+        # Layout is {datadir}/{user}/files/{path} relative to the configured
+        # `datadirectory`, which defaults to {bind mount root}/files (confirmed
+        # via `occ config:system:get datadirectory`) -- "/mnt/data" is the
+        # bind mount's target path inside the container (see docker-compose.yaml's
+        # owncloud service), not OWNCLOUD_DATA_PATH, which is the host-side path.
+        for suffix in COMMENT ANALYSIS; do
+          DEST_DIR="/mnt/data/files/${{ env.OWNCLOUD_USER_ID }}/files/${{ env.SAVE_PATH }}/${TEST_SOURCE_ID}-${suffix}/TAROT-TCA"
+          docker exec owncloud_server mkdir -p "$DEST_DIR"
+          docker cp skyportal_processor_service/tests/fixtures/test_image.fits "owncloud_server:$DEST_DIR/test_image.fits"
+        done
+
+        # OwnCloud indexes files into a DB-backed cache separate from the raw
+        # filesystem, so a files:scan is still needed for WebDAV/PROPFIND
+        # (what comment_watcher.py reads with) to see it. One scan covers
+        # both paths seeded above.
+        docker exec owncloud_server occ files:scan "${{ env.OWNCLOUD_USER_ID }}"
+
+    - name: Run comment watcher integration test
+      run: |
+        cd skyportal_processor_service/tests
+        echo "Running pytest against the live comment watcher..."
+        # -n 2: the comment- and analysis-triggered tests use separate
+        # sources and have no shared mutable state, so they run concurrently
+        # against the one live comment_watcher.py/StdWeb/SkyPortal stack.
+        python -m pytest test_integration_comment_watcher.py -v -s -n 2
+        echo "Integration test completed"
+
+    - name: Stop comment watcher
+      if: always()
+      run: |
+        kill $WATCHER_PID 2>/dev/null || true
+        wait $WATCHER_PID 2>/dev/null || true
+
+    - name: Show container logs
+      if: always()
+      run: |
+        echo "Collecting container logs for debugging..."
+        mkdir -p debug_logs
+
+        docker logs owncloud_server > debug_logs/owncloud.log 2>&1 || echo "Failed to get owncloud logs" > debug_logs/owncloud.log
+        docker logs skyportal-web > debug_logs/skyportal.log 2>&1 || echo "Failed to get skyportal logs" > debug_logs/skyportal.log
+        docker logs postgres16 > debug_logs/postgres.log 2>&1 || echo "Failed to get postgres logs" > debug_logs/postgres.log
+        docker logs stdweb-web > debug_logs/stdweb.log 2>&1 || echo "Failed to get stdweb logs" > debug_logs/stdweb.log
+        docker ps -a > debug_logs/containers_status.txt 2>&1 || echo "Failed to get containers status" > debug_logs/containers_status.txt
+
+        echo "Debug logs collected and will be saved to artifacts"
+
+    - name: Save debug artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: debug-logs
+        path: |
+          debug_logs/
+          skyportal_processor_service/watcher.log
+        retention-days: 7
+
+    - name: Cleanup
+      if: always()
+      run: |
+        echo "Cleaning up services..."
+        cd skyportal_processor_service && docker compose down -v || true
+        echo "Cleanup completed"

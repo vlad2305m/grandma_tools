@@ -192,3 +192,7 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Local docker-compose bind-mounted runtime data (owncloud/postgres data dirs
+# from skyportal_processor_service/docker-compose.yaml -- never committed)
+skyportal_processor_service/data/

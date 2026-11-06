@@ -1,0 +1,194 @@
+version: "3"
+
+volumes:
+  mysql:
+    driver: local
+  redis:
+    driver: local
+  dbdata:
+  thumbnails:
+  persistentdata:
+
+services:
+  # ---- OwnCloud (file source) ----
+  owncloud:
+    image: owncloud/server:10.15
+    container_name: owncloud_server
+    restart: always
+    ports:
+      - 8080:8080
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - OWNCLOUD_DOMAIN=localhost:8080
+      - OWNCLOUD_TRUSTED_DOMAINS=localhost
+      - OWNCLOUD_DB_TYPE=mysql
+      - OWNCLOUD_DB_NAME=owncloud
+      - OWNCLOUD_DB_USERNAME=owncloud
+      - OWNCLOUD_DB_PASSWORD=owncloud
+      - OWNCLOUD_DB_HOST=mariadb
+      - OWNCLOUD_ADMIN_USERNAME=admin
+      - OWNCLOUD_ADMIN_PASSWORD=admin
+      - OWNCLOUD_MYSQL_UTF8MB4=true
+      - OWNCLOUD_REDIS_ENABLED=true
+      - OWNCLOUD_REDIS_HOST=redis
+    healthcheck:
+      test: ["CMD", "/usr/bin/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    volumes:
+      # Host bind mount (not a named volume) so local dev's
+      # seed_owncloud_file() fallback (see
+      # tests/test_integration_comment_watcher.py) can write fixture files
+      # directly to disk. CI itself seeds via `docker cp` instead -- see
+      # skyportal_processor_service_ci.yaml's "Seed OwnCloud fixture file".
+      - ./data/owncloud:/mnt/data
+
+  mariadb:
+    image: mariadb:10.11 # minimum required ownCloud version is 10.9
+    container_name: owncloud_mariadb
+    restart: always
+    environment:
+      - MYSQL_ROOT_PASSWORD=owncloud
+      - MYSQL_USER=owncloud
+      - MYSQL_PASSWORD=owncloud
+      - MYSQL_DATABASE=owncloud
+      - MARIADB_AUTO_UPGRADE=1
+    command: ["--max-allowed-packet=128M", "--innodb-log-file-size=64M"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-u", "root", "--password=owncloud"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - mysql:/var/lib/mysql
+
+  redis:
+    image: redis:6
+    container_name: owncloud_redis
+    restart: always
+    command: ["--databases", "1"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - redis:/data
+
+  # ---- SkyPortal (comment source/trigger) ----
+  web:
+    image: skyportal/web
+    container_name: skyportal-web
+    ports:
+      - "9000:5000"
+      - "9001:5001"
+    # comment_watcher.py's own optional webhook listener (WEBHOOK_URL, see
+    # README.md's "Triggering a rescan") runs on the host, not in this
+    # compose network -- SkyPortal needs this to call back out to it.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - thumbnails:/skyportal/static/thumbnails:z
+      - persistentdata:/skyportal/persistentdata:z
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    # Supervisor starts ~39 services (migration check, 4 app workers,
+    # nginx, rspack, ...) on container start, which can take a while --
+    # budget matches the 300s this used to be polled for externally in CI
+    # (`docker compose up --wait` now blocks on this directly instead).
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:5000/api/sysinfo"]
+      interval: 10s
+      timeout: 5s
+      retries: 24
+      start_period: 60s
+
+  # Mirrors upstream skyportal's own docker-compose.yaml: run_production
+  # doesn't create tables, so without this, supervisor's app workers race
+  # straight into an empty schema and fail FATAL/permanent on boot. Gating
+  # `web` on this finishing (service_completed_successfully, below) means
+  # it never starts against an incomplete database. create_tables() is
+  # checkfirst=True, so this is a safe no-op on an already-populated db.
+  db-init:
+    image: skyportal/web
+    command:
+      [
+        "bash",
+        "-c",
+        "source .venv/bin/activate && PYTHONPATH=. python skyportal/initial_setup.py --config=config.yaml",
+      ]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    # SkyPortal's summary_embeddings table needs pgvector's `vector` type
+    # (the openai_analysis_service AI-summarization feature) -- a plain
+    # postgres:16 image is missing the extension entirely and
+    # make db_create_tables fails outright. Same image skyportal's own
+    # docker-compose.yaml/CI workflows use for this.
+    image: pgvector/pgvector:pg16
+    container_name: postgres16
+    environment:
+      POSTGRES_USER: skyportal
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: skyportal
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ./data/dbdata:/var/lib/postgresql/data:z
+    restart: on-failure:3
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U skyportal -d skyportal"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---- StdWeb (photometry processing) ----
+  # A single container: stdweb's settings.py hardcodes CELERY_BROKER_URL to
+  # redis://localhost/ with no env override, so redis + the celery worker +
+  # the Django dev server all have to share one network namespace. Its own
+  # SQLite db and DATA_PATH/TASKS_PATH are ephemeral container-local state,
+  # which is fine for a CI run. Upstream stdweb (karpov-sv/stdweb) has no
+  # Dockerfile of its own -- see stdweb-ci/README.md; local dev needs one
+  # copied (or symlinked) into its own stdweb checkout the same way CI's
+  # "Prepare StdWeb Docker build files" step does.
+  stdweb:
+    build:
+      # Local dev: grandma_tools/ and stdweb/ are sibling checkouts, two
+      # levels up from here. CI checks grandma_tools out at the workspace
+      # root and stdweb alongside it (one level up) -- override via
+      # STDWEB_PATH=../stdweb there. See skyportal_processor_service_ci.yaml.
+      context: ${STDWEB_PATH:-../../stdweb}
+    container_name: stdweb-web
+    environment:
+      # Unset by default (falls through to a live VizieR query, unchanged
+      # production behavior) -- CI sets this to point at a pre-fetched
+      # catalogue fixture so the integration test doesn't depend on a live,
+      # occasionally-flaky third-party service. See
+      # stdweb-ci/local_catalog.patch and tests/fixtures/README.md.
+      - STDWEB_LOCAL_CATALOG_FILE=${STDWEB_LOCAL_CATALOG_FILE:-}
+      # StdWeb's own POST /api/tasks/{id}/skyportal/ makes a direct PUT to
+      # SkyPortal using *this* token, separate from comment_watcher.py's --
+      # see stdweb/settings.py's SKYPORTAL_TOKEN/SKYPORTAL_BASE_URL. "web"
+      # is this compose network's SkyPortal service/port, not the
+      # host-mapped localhost:9000. Unset by default; not known until
+      # after SkyPortal's init, so CI only starts this service once it's
+      # known -- see skyportal_processor_service_ci.yaml's "Start StdWeb".
+      - SKYPORTAL_BASE_URL=http://web:5000
+      - SKYPORTAL_TOKEN=${SKYPORTAL_TOKEN:-}
+    volumes:
+      - ./tests/fixtures:/data/fixtures:ro
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/login/')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s

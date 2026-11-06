@@ -48,18 +48,33 @@ jobs:
         
     - name: Start all services
       run: |
+        # docker-compose.yaml's `web` depends on `db-init` (which creates
+        # the schema) completing successfully, which itself depends on
+        # `db`'s healthcheck -- `docker compose up` always waits out that
+        # whole dependency chain before starting `web`, so by the time this
+        # step returns, `web` never raced an empty schema at all (mirrors
+        # upstream skyportal's own docker-compose.yaml).
         cd owncloud_service
         echo "Starting services..."
         docker compose up -d
+
+    - name: Wait for SkyPortal to be ready
+      run: |
+        # Supervisor starts ~39 services (migration check, 4 app workers,
+        # nginx, rspack, ...) on container start, which can take a while.
+        # load_demo_data needs the HTTP API and gives up after a fixed
+        # number of retries (tools/data_loader.py), so without this wait it
+        # can fail outright on a slow-to-start container rather than just
+        # running late.
+        echo "Waiting for SkyPortal (migration + app workers + nginx) to come up..."
+        timeout 300 bash -c 'until curl -sf http://localhost:9000/api/sysinfo > /dev/null; do sleep 3; done'
+        echo "SkyPortal is up"
         
-    - name: Initialize SkyPortal database
+    - name: Load SkyPortal demo data
       run: |
         cd skyportal
-        echo "Creating database tables..."
-        docker exec skyportal-web bash -c 'source /skyportal_env/bin/activate && FLAGS="--config=config.yaml" make db_create_tables'
-        
         echo "Loading demo data..."
-        docker exec skyportal-web bash -c 'source /skyportal_env/bin/activate && FLAGS="--create_tables --config=config.yaml" make load_demo_data'
+        docker exec skyportal-web bash -c 'source /skyportal/.venv/bin/activate && FLAGS="--create_tables --config=config.yaml" make load_demo_data'
         echo "Database initialized successfully"
         
     - name: Extract SkyPortal token
@@ -110,7 +125,9 @@ jobs:
       run: |
         cd owncloud_service
         echo "Installing source watcher dependencies."
-        pip install -r requirements.txt
+        # Runner's system Python is PEP 668 externally-managed; this is a
+        # disposable CI runner, not a system to protect from pip.
+        pip install --break-system-packages -r requirements.txt
         
     - name: Test source watcher startup
       run: |
