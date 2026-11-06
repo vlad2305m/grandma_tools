@@ -213,27 +213,34 @@ jobs:
         # SkyPortal's debug-login OAuth stand-in.
         SKYPORTAL_TOKEN="${{ steps.extract_skyportal_token.outputs.SKYPORTAL_TOKEN }}"
 
-        USER_ID=$(curl -sf -X POST http://localhost:9000/api/user \
-          -H "Authorization: token $SKYPORTAL_TOKEN" \
-          -H "Content-Type: application/json" \
-          -d '{"username": "ci-poster", "groupIDsAndAdmin": [[1, true]]}' \
-          | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['id'])")
-
-        if [ -z "$USER_ID" ]; then
-          echo "Failed to create second SkyPortal user"
+        # Retries with visible diagnostics on failure: this call has twice
+        # failed in CI with no trace of the request ever reaching SkyPortal's
+        # own access log (so plain -f's silent empty output on failure gave
+        # no signal of why) -- print the real HTTP status/body so a repeat
+        # failure is actually debuggable, and tolerate a slow/transient
+        # response rather than failing on the first hiccup.
+        api_post() {
+          for attempt in 1 2 3 4 5; do
+            HTTP_CODE=$(curl -s -o /tmp/api_response.json -w "%{http_code}" \
+              -X POST "http://localhost:9000$1" \
+              -H "Authorization: token $SKYPORTAL_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$2")
+            if [ "$HTTP_CODE" = "200" ]; then
+              return 0
+            fi
+            echo "Attempt $attempt: POST $1 returned HTTP $HTTP_CODE: $(cat /tmp/api_response.json)"
+            sleep 5
+          done
+          echo "Giving up on POST $1 after 5 attempts"
           exit 1
-        fi
+        }
 
-        POSTER_TOKEN=$(curl -sf -X POST http://localhost:9000/api/internal/tokens \
-          -H "Authorization: token $SKYPORTAL_TOKEN" \
-          -H "Content-Type: application/json" \
-          -d "{\"user_id\": $USER_ID, \"acls\": [\"Comment\"], \"name\": \"ci-poster-token\"}" \
-          | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['token_id'])")
+        api_post /api/user '{"username": "ci-poster", "groupIDsAndAdmin": [[1, true]]}'
+        USER_ID=$(python3 -c "import json; print(json.load(open('/tmp/api_response.json'))['data']['id'])")
 
-        if [ -z "$POSTER_TOKEN" ]; then
-          echo "Failed to create token for second SkyPortal user"
-          exit 1
-        fi
+        api_post /api/internal/tokens "{\"user_id\": $USER_ID, \"acls\": [\"Comment\"], \"name\": \"ci-poster-token\"}"
+        POSTER_TOKEN=$(python3 -c "import json; print(json.load(open('/tmp/api_response.json'))['data']['token_id'])")
 
         echo "SKYPORTAL_POSTER_TOKEN=$POSTER_TOKEN" >> $GITHUB_OUTPUT
 
