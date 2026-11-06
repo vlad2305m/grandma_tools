@@ -92,6 +92,16 @@ services:
     depends_on:
       db-init:
         condition: service_completed_successfully
+    # Supervisor starts ~39 services (migration check, 4 app workers,
+    # nginx, rspack, ...) on container start, which can take a while --
+    # budget matches the 300s this used to be polled for externally in CI
+    # (`docker compose up --wait` now blocks on this directly instead).
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:5000/api/sysinfo"]
+      interval: 10s
+      timeout: 5s
+      retries: 24
+      start_period: 60s
 
   # Mirrors upstream skyportal's own docker-compose.yaml: run_production
   # does not create tables, so supervisor's app workers race straight into
