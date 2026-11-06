@@ -29,10 +29,7 @@ Required packages:
 * `requests`
 * `python-dotenv`
 
-`tests/` additionally needs `pytest` and `playwright` (with a Chromium
-browser: `python -m playwright install chromium`) -- the integration test
-drives a real browser to post comments, since SkyPortal marks any
-token-authenticated request as bot, which `comment_watcher.py` ignores.
+`tests/` additionally needs `pytest`.
 
 ## Configuration
 
@@ -122,11 +119,12 @@ public/discoverable groups there than to arbitrary rows like an Analysis).
 `comment_watcher.py` never writes to OwnCloud (only `PROPFIND`/`GET`) -- it's
 strictly a consumer of files other tools put there. Tests follow the same
 rule, including against the disposable Docker sandbox in
-`docker-compose.yaml`: `tests/test_integration_comment_watcher.py` seeds its
-fixture file by writing directly to OwnCloud's bind-mounted data directory
-(`OWNCLOUD_DATA_PATH`, see `.env.default`) and triggering a local `occ
-files:scan` via `docker exec`, never a WebDAV `PUT`/`MKCOL`/`DELETE`. When
-testing manually against a real (non-Docker) OwnCloud instance, this means
-using files that already exist there -- never create or upload new ones for
-a test, since there is no "local storage" to write to directly on a remote
+`docker-compose.yaml`: the fixture file is placed straight into OwnCloud's
+on-disk storage (CI does this via `docker cp`/`docker exec occ files:scan`;
+a standalone local run's `seed_owncloud_file()` does the equivalent by
+writing to the bind-mounted data directory directly) and indexed with
+`occ files:scan`, never a WebDAV `PUT`/`MKCOL`/`DELETE`. When testing
+manually against a real (non-Docker) OwnCloud instance, this means using
+files that already exist there -- never create or upload new ones for a
+test, since there is no "local storage" to write to directly on a remote
 instance.

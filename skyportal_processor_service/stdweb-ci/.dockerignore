@@ -11,10 +11,10 @@ __pycache__
 # see the Dockerfile.
 db.sqlite3
 db.sqlite3-journal
-# Stray local redis dump from manual `redis-server`/`docker exec` runs during
-# development -- never bake a host-local persisted DB into the image; a
-# foreign/stale dump.rdb makes the container's own redis-server crash on
-# startup with "Wrong signature trying to load DB from file".
+# Note: a stray dump.rdb from local redis testing was once copied into the
+# image and made the container's own redis-server crash on startup ("Wrong
+# signature trying to load DB from file") -- never bake a host-local
+# persisted DB into the image.
 dump.rdb
 data/
 tasks/

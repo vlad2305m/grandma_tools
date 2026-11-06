@@ -93,15 +93,11 @@ services:
         condition: service_completed_successfully
 
   # Mirrors upstream skyportal's own docker-compose.yaml: run_production
-  # does not create tables, so supervisor's app workers race straight into
-  # an empty schema the instant `web` boots (app_server.py's make_app
-  # raises "No tables found", and supervisor gives up retrying it --
-  # FATAL, permanent -- long before a separately-run `make db_create_tables`
-  # finishes). Running it here first and gating `web` on it finishing
-  # (`service_completed_successfully` below) means `web` never starts
-  # against an incomplete database at all. initial_setup.py's
-  # create_tables() is checkfirst=True, so this is a safe no-op on an
-  # already-populated database (e.g. a reused local bind mount).
+  # doesn't create tables, so without this, supervisor's app workers race
+  # straight into an empty schema and fail FATAL/permanent on boot. Gating
+  # `web` on this finishing (service_completed_successfully, below) means
+  # it never starts against an incomplete database. create_tables() is
+  # checkfirst=True, so this is a safe no-op on an already-populated db.
   db-init:
     image: skyportal/web
     command:

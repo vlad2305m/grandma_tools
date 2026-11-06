@@ -41,10 +41,11 @@ services:
       timeout: 10s
       retries: 5
     volumes:
-      # Host bind mount (not a named Docker volume) so tests/local dev can
-      # seed fixture files by writing directly to disk -- see
-      # tests/test_integration_comment_watcher.py -- instead of ever going
-      # through OwnCloud's own write API, even in this disposable sandbox.
+      # Host bind mount (not a named volume) so local dev's
+      # seed_owncloud_file() fallback (see
+      # tests/test_integration_comment_watcher.py) can write fixture files
+      # directly to disk. CI itself seeds via `docker cp` instead -- see
+      # skyportal_processor_service_ci.yaml's "Seed OwnCloud fixture file".
       - ./data/owncloud:/mnt/data
 
   mariadb:
@@ -104,15 +105,11 @@ services:
       start_period: 60s
 
   # Mirrors upstream skyportal's own docker-compose.yaml: run_production
-  # does not create tables, so supervisor's app workers race straight into
-  # an empty schema the instant `web` boots (app_server.py's make_app
-  # raises "No tables found", and supervisor gives up retrying it --
-  # FATAL, permanent -- long before a separately-run `make db_create_tables`
-  # finishes). Running it here first and gating `web` on it finishing
-  # (`service_completed_successfully` below) means `web` never starts
-  # against an incomplete database at all. initial_setup.py's
-  # create_tables() is checkfirst=True, so this is a safe no-op on an
-  # already-populated database (e.g. a reused local bind mount).
+  # doesn't create tables, so without this, supervisor's app workers race
+  # straight into an empty schema and fail FATAL/permanent on boot. Gating
+  # `web` on this finishing (service_completed_successfully, below) means
+  # it never starts against an incomplete database. create_tables() is
+  # checkfirst=True, so this is a safe no-op on an already-populated db.
   db-init:
     image: skyportal/web
     command:
@@ -172,14 +169,12 @@ services:
       # stdweb-ci/local_catalog.patch and tests/fixtures/README.md.
       - STDWEB_LOCAL_CATALOG_FILE=${STDWEB_LOCAL_CATALOG_FILE:-}
       # StdWeb's own POST /api/tasks/{id}/skyportal/ makes a direct PUT to
-      # SkyPortal using *this* token, not comment_watcher.py's -- see
-      # stdweb/settings.py's SKYPORTAL_TOKEN/SKYPORTAL_BASE_URL config()
-      # calls. "web" is this compose network's SkyPortal service name/port
-      # (container-to-container -- not the host-mapped localhost:9000 the
-      # test and comment_watcher.py use). Unset by default; SKYPORTAL_TOKEN
-      # isn't known until after SkyPortal's own init, so CI starts this
-      # service (not at all before this point) only once it's known -- see
-      # skyportal_processor_service_ci.yaml's "Start StdWeb" step.
+      # SkyPortal using *this* token, separate from comment_watcher.py's --
+      # see stdweb/settings.py's SKYPORTAL_TOKEN/SKYPORTAL_BASE_URL. "web"
+      # is this compose network's SkyPortal service/port, not the
+      # host-mapped localhost:9000. Unset by default; not known until
+      # after SkyPortal's init, so CI only starts this service once it's
+      # known -- see skyportal_processor_service_ci.yaml's "Start StdWeb".
       - SKYPORTAL_BASE_URL=http://web:5000
       - SKYPORTAL_TOKEN=${SKYPORTAL_TOKEN:-}
     volumes:

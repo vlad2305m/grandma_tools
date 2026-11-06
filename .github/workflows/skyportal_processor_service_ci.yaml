@@ -85,27 +85,16 @@ jobs:
 
     - name: Start SkyPortal and OwnCloud
       run: |
-        # docker-compose.yaml's `web` depends on `db-init` (which creates
-        # the schema) completing successfully, which itself depends on
-        # `db`'s healthcheck -- `docker compose up` always waits out that
-        # whole dependency chain before starting `web`, `-d` or not, so by
-        # the time this step returns, `web` never raced an empty schema at
-        # all (mirrors upstream skyportal's own docker-compose.yaml).
+        # --wait blocks until web's own healthcheck reports healthy
+        # (supervisor's ~39 services can take a while to actually start
+        # serving) -- no separate readiness polling needed; the schema-race
+        # avoidance itself is handled by db-init's own depends_on chain, see
+        # docker-compose.yaml.
         #
-        # --wait additionally blocks until `web`'s own healthcheck reports
-        # healthy (supervisor's ~39 services -- migration check, 4 app
-        # workers, nginx, rspack, ... -- can take a while to actually start
-        # serving), replacing a separate curl-polling step with the same
-        # budget expressed once, in docker-compose.yaml, reusable for local
-        # dev too.
-        #
-        # stdweb isn't started here: its own SKYPORTAL_TOKEN (for its direct
-        # PUT to SkyPortal, see docker-compose.yaml's stdweb service) isn't
-        # known until after SkyPortal's own init runs below. Starting it
-        # later, once, with that token already set from the start, avoids
-        # ever having to stop+recreate it mid-run -- cheaper, and one fewer
-        # resource spike competing with SkyPortal's own startup/API calls on
-        # a resource-constrained CI runner.
+        # stdweb isn't started here: its SKYPORTAL_TOKEN (for its own direct
+        # PUT to SkyPortal) isn't known until SkyPortal's init runs below.
+        # Starting it once, later, with the token already set avoids a
+        # stop+recreate mid-run.
         cd skyportal_processor_service
         echo "Starting services..."
         docker compose up -d --wait --build db db-init mariadb redis owncloud web
@@ -138,13 +127,10 @@ jobs:
         STDWEB_LOCAL_CATALOG_FILE: /data/fixtures/ps1_cat.parquet
         SKYPORTAL_TOKEN: ${{ steps.extract_skyportal_token.outputs.SKYPORTAL_TOKEN }}
       run: |
-        # First start, not a restart: SKYPORTAL_TOKEN is already set, so
-        # StdWeb's own SkyPortal upload endpoint works from the start --
-        # see "Start SkyPortal and OwnCloud" above for why this is deferred
-        # to here instead of starting (and later recreating) it earlier.
-        # --wait blocks until stdweb's own healthcheck (redis+migrate+
-        # celery+runserver all up) reports healthy, replacing a separate
-        # curl-polling step.
+        # First start (not a restart): SKYPORTAL_TOKEN is already set, so
+        # StdWeb's own direct upload to SkyPortal works immediately. --wait
+        # blocks on its healthcheck (redis+celery+runserver all up) instead
+        # of a separate curl-polling step.
         cd skyportal_processor_service
         echo "Starting StdWeb..."
         docker compose up -d --wait --build stdweb
@@ -176,22 +162,18 @@ jobs:
     - name: Create second SkyPortal user
       id: create_poster_user
       run: |
-        # comment_watcher.py filters out comments authored by its own user id
-        # (SELF_USER_ID), not by SkyPortal's bot flag -- every token-authenticated
-        # request is bot=True regardless of which token (see
-        # skyportal/handlers/api/comment.py), so triggering it needs a token
-        # belonging to a genuinely different user. Plain API calls (POST
-        # /api/user, then /api/internal/tokens for that user) replace what
-        # previously needed a real Playwright browser session logged in via
-        # SkyPortal's debug-login OAuth stand-in.
+        # comment_watcher.py's self-reply filter excludes its own
+        # SELF_USER_ID, not SkyPortal's bot flag (every token-authenticated
+        # request is bot=True regardless of token) -- triggering it needs a
+        # token belonging to a genuinely different user. Note: previously
+        # needed a real Playwright/debug-login browser session for this;
+        # plain POST /api/user + /api/internal/tokens replaces it.
         SKYPORTAL_TOKEN="${{ steps.extract_skyportal_token.outputs.SKYPORTAL_TOKEN }}"
 
-        # Retries with visible diagnostics on failure: this call has twice
-        # failed in CI with no trace of the request ever reaching SkyPortal's
-        # own access log (so plain -f's silent empty output on failure gave
-        # no signal of why) -- print the real HTTP status/body so a repeat
-        # failure is actually debuggable, and tolerate a slow/transient
-        # response rather than failing on the first hiccup.
+        # Retries + real status/body on failure. Note: a previous plain
+        # `curl -sf` failed silently here in CI (no server-side trace of the
+        # request at all), giving no signal why -- this makes a repeat
+        # failure debuggable and tolerates a transient hiccup.
         api_post() {
           for attempt in 1 2 3 4 5; do
             HTTP_CODE=$(curl -s -o /tmp/api_response.json -w "%{http_code}" \
@@ -307,17 +289,13 @@ jobs:
 
     - name: Seed OwnCloud fixture file
       run: |
-        # docker cp talks to the Docker daemon directly (root), bypassing
-        # the bind-mounted data dir's host-side permissions entirely --
-        # OwnCloud's container provisions it as its own internal uid
-        # (33/www-data), which excludes the runner's own user, previously
-        # worked around with `sudo chmod -R a+rwX` on the whole tree. Doing
-        # the copy here, as a real CI step, instead of from Python inside
-        # the test (os.makedirs + shutil.copyfile against the host path)
-        # means SOURCE_ID has to be known up front -- generated here and
-        # exported as TEST_SOURCE_ID for the test to pick up, rather than
-        # the test generating its own after the file would already need to
-        # be in place.
+        # docker cp talks to the Docker daemon directly, bypassing the
+        # bind-mounted data dir's host-side permissions entirely (OwnCloud
+        # owns it as uid 33/www-data). Note: previously seeded via a
+        # host-path write from Python + `sudo chmod -R a+rwX` on the whole
+        # tree. SOURCE_ID has to be known up front for the destination path,
+        # so it's generated here and exported as TEST_SOURCE_ID for the test
+        # to pick up.
         TEST_SOURCE_ID="CIRESCANTEST$(openssl rand -hex 4)"
         echo "TEST_SOURCE_ID=$TEST_SOURCE_ID" >> $GITHUB_ENV
 
