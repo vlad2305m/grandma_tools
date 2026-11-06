@@ -87,6 +87,11 @@ services:
     ports:
       - "9000:5000"
       - "9001:5001"
+    # comment_watcher.py's own optional webhook listener (WEBHOOK_URL, see
+    # README.md's "Triggering a rescan") runs on the host, not in this
+    # compose network -- SkyPortal needs this to call back out to it.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - thumbnails:/skyportal/static/thumbnails:z
       - persistentdata:/skyportal/persistentdata:z
