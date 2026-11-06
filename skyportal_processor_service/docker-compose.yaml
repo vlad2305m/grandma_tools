@@ -167,10 +167,9 @@ services:
       # calls. "web" is this compose network's SkyPortal service name/port
       # (container-to-container -- not the host-mapped localhost:9000 the
       # test and comment_watcher.py use). Unset by default; SKYPORTAL_TOKEN
-      # isn't known until after SkyPortal's own init, so CI sets it by
-      # recreating this one container once the token exists -- see
-      # skyportal_processor_service_ci.yaml's "Configure StdWeb's SkyPortal
-      # token" step.
+      # isn't known until after SkyPortal's own init, so CI starts this
+      # service (not at all before this point) only once it's known -- see
+      # skyportal_processor_service_ci.yaml's "Start StdWeb" step.
       - SKYPORTAL_BASE_URL=http://web:5000
       - SKYPORTAL_TOKEN=${SKYPORTAL_TOKEN:-}
     volumes:

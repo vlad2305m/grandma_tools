@@ -104,14 +104,7 @@ jobs:
         make docker-local
         echo "SkyPortal images built successfully"
 
-    - name: Start all services
-      env:
-        STDWEB_PATH: ../stdweb
-        # In-container path matching docker-compose.yaml's fixtures bind
-        # mount -- activates the STDWEB_LOCAL_CATALOG_FILE escape hatch
-        # from local_catalog.patch, so photometry calibration doesn't
-        # depend on a live VizieR query.
-        STDWEB_LOCAL_CATALOG_FILE: /data/fixtures/ps1_cat.parquet
+    - name: Start SkyPortal and OwnCloud
       run: |
         # docker-compose.yaml's `web` depends on `db-init` (which creates
         # the schema) completing successfully, which itself depends on
@@ -119,15 +112,17 @@ jobs:
         # whole dependency chain before starting `web`, `-d` or not, so by
         # the time this step returns, `web` never raced an empty schema at
         # all (mirrors upstream skyportal's own docker-compose.yaml).
+        #
+        # stdweb isn't started here: its own SKYPORTAL_TOKEN (for its direct
+        # PUT to SkyPortal, see docker-compose.yaml's stdweb service) isn't
+        # known until after SkyPortal's own init runs below. Starting it
+        # later, once, with that token already set from the start, avoids
+        # ever having to stop+recreate it mid-run -- cheaper, and one fewer
+        # resource spike competing with SkyPortal's own startup/API calls on
+        # a resource-constrained CI runner.
         cd skyportal_processor_service
         echo "Starting services..."
-        docker compose up -d --build
-
-    - name: Wait for StdWeb to be ready
-      run: |
-        echo "Waiting for StdWeb (redis+migrate+celery+runserver) to come up..."
-        timeout 120 bash -c 'until curl -sf http://localhost:8000/login/ > /dev/null; do sleep 2; done'
-        echo "StdWeb is up"
+        docker compose up -d --build db db-init mariadb redis owncloud web
 
     - name: Wait for SkyPortal to be ready
       run: |
@@ -162,29 +157,24 @@ jobs:
 
         echo "SKYPORTAL_TOKEN=$SKYPORTAL_TOKEN" >> $GITHUB_OUTPUT
 
-    - name: Configure StdWeb's SkyPortal token
+    - name: Start StdWeb
       env:
         STDWEB_PATH: ../stdweb
         STDWEB_LOCAL_CATALOG_FILE: /data/fixtures/ps1_cat.parquet
         SKYPORTAL_TOKEN: ${{ steps.extract_skyportal_token.outputs.SKYPORTAL_TOKEN }}
       run: |
-        # StdWeb's own POST /api/tasks/{id}/skyportal/ makes a direct PUT to
-        # SkyPortal using its own SKYPORTAL_TOKEN env var (see
-        # docker-compose.yaml's stdweb service) -- which isn't known until
-        # SkyPortal's own init has run, after stdweb already started. `up`
-        # recreates just this one container now that it's set; the others
-        # are already healthy and untouched (same env, same image/config).
-        # Done before StdWeb's own superuser/token creation below, since
-        # recreating the container wipes its ephemeral container-local
-        # SQLite db (see docker-compose.yaml's stdweb service comment).
+        # First start, not a restart: SKYPORTAL_TOKEN is already set, so
+        # StdWeb's own SkyPortal upload endpoint works from the start --
+        # see "Start SkyPortal and OwnCloud" above for why this is deferred
+        # to here instead of starting (and later recreating) it earlier.
         cd skyportal_processor_service
-        echo "Recreating StdWeb with its SkyPortal token..."
-        docker compose up -d stdweb
+        echo "Starting StdWeb..."
+        docker compose up -d --build stdweb
 
-    - name: Wait for StdWeb to be ready again
+    - name: Wait for StdWeb to be ready
       run: |
-        echo "Waiting for StdWeb to come back up after recreation..."
-        timeout 60 bash -c 'until curl -sf http://localhost:8000/login/ > /dev/null; do sleep 2; done'
+        echo "Waiting for StdWeb (redis+migrate+celery+runserver) to come up..."
+        timeout 120 bash -c 'until curl -sf http://localhost:8000/login/ > /dev/null; do sleep 2; done'
         echo "StdWeb is up"
 
     - name: Create StdWeb superuser and API token
