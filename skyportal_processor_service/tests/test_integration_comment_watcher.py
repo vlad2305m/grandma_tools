@@ -14,9 +14,10 @@ load_dotenv("../.env")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from comment_watcher import RESCAN_SERVICE_NAME  # noqa: E402
 
-# OwnCloud's on-disk data directory, as bind-mounted by docker-compose.yaml --
-# tests seed fixture files by writing here directly (see seed_owncloud_file
-# below), never through OwnCloud's own write API.
+# OwnCloud's on-disk data directory, as bind-mounted by docker-compose.yaml.
+# Used only by seed_owncloud_file()'s local-run fallback below -- CI places
+# the fixture itself via `docker cp` (see "Seed OwnCloud fixture file" in
+# skyportal_processor_service_ci.yaml), never through OwnCloud's write API.
 OWNCLOUD_DATA_PATH = os.getenv("OWNCLOUD_DATA_PATH", "../data/owncloud")
 OWNCLOUD_USER_ID = os.getenv("OWNCLOUD_USER_ID")
 SAVE_PATH = os.getenv("SAVE_PATH")
@@ -40,7 +41,12 @@ FIXTURE_PATH = os.path.join(os.path.dirname(__file__), "fixtures", "test_image.f
 FIXTURE_RA = 244.000112892
 FIXTURE_DEC = 22.2673593981
 
-SOURCE_ID = f"CIRESCANTEST{uuid.uuid4().hex[:8]}"
+# CI's "Seed OwnCloud fixture file" step generates this and places the
+# fixture file under it (via `docker cp`, not this test) before pytest runs
+# -- it has to know the id up front to pick a destination path. Falls back
+# to a locally-generated one for standalone/local runs, where
+# seed_owncloud_file() below does the equivalent placement itself.
+SOURCE_ID = os.getenv("TEST_SOURCE_ID") or f"CIRESCANTEST{uuid.uuid4().hex[:8]}"
 TELESCOPE_FOLDER = "TAROT-TCA"
 
 
@@ -152,9 +158,13 @@ def seed_source_and_file():
     )
     response.raise_for_status()
 
-    seed_owncloud_file(
-        f"{SAVE_PATH}/{SOURCE_ID}/{TELESCOPE_FOLDER}/test_image.fits", FIXTURE_PATH
-    )
+    if not os.getenv("TEST_SOURCE_ID"):
+        # Standalone/local run: CI's "Seed OwnCloud fixture file" step didn't
+        # already place it (TEST_SOURCE_ID unset means SOURCE_ID above was
+        # generated locally), so do it here instead.
+        seed_owncloud_file(
+            f"{SAVE_PATH}/{SOURCE_ID}/{TELESCOPE_FOLDER}/test_image.fits", FIXTURE_PATH
+        )
 
     yield
     # No cleanup: this only runs against ephemeral CI containers (owncloud,

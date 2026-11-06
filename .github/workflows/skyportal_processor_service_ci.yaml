@@ -14,10 +14,10 @@ env:
   OWNCLOUD_USERNAME: "admin"
   OWNCLOUD_TOKEN: "admin"
   OWNCLOUD_USER_ID: "admin"
-  # Host path of the owncloud service's bind-mounted data dir (see
-  # docker-compose.yaml) -- tests write fixture files here directly instead
-  # of through OwnCloud's write API. Matches the default in
-  # test_integration_comment_watcher.py; set explicitly for clarity.
+  # Only used by the test's standalone-run fallback now (the "Seed OwnCloud
+  # fixture file" step below places the fixture itself, via `docker cp`
+  # into the container, not this host path) -- kept for parity with
+  # test_integration_comment_watcher.py's own default.
   OWNCLOUD_DATA_PATH: "../data/owncloud"
 
   SAVE_PATH: "Candidates/Skyportal"
@@ -332,19 +332,35 @@ jobs:
 
         echo "Comment watcher startup test completed successfully -- leaving it running for the integration test"
 
-    - name: Fix OwnCloud data directory permissions
+    - name: Seed OwnCloud fixture file
       run: |
-        # OwnCloud's container provisions its bind-mounted data directory
-        # (docker-compose.yaml's ./data/owncloud) as its own internal
-        # container user (uid 33/www-data), with directory permissions
-        # (e.g. drwxrwx---) that exclude the runner's own user entirely.
-        # seed_owncloud_file() in the integration test writes fixture
-        # files directly into this tree from plain Python running as the
-        # runner user (see its own docstring for why), so it needs write
-        # access -- granted here rather than in docker-compose.yaml since
-        # the restrictive permissions are OwnCloud's own default and come
-        # from inside the container, not something compose config controls.
-        sudo chmod -R a+rwX skyportal_processor_service/data/owncloud
+        # docker cp talks to the Docker daemon directly (root), bypassing
+        # the bind-mounted data dir's host-side permissions entirely --
+        # OwnCloud's container provisions it as its own internal uid
+        # (33/www-data), which excludes the runner's own user, previously
+        # worked around with `sudo chmod -R a+rwX` on the whole tree. Doing
+        # the copy here, as a real CI step, instead of from Python inside
+        # the test (os.makedirs + shutil.copyfile against the host path)
+        # means SOURCE_ID has to be known up front -- generated here and
+        # exported as TEST_SOURCE_ID for the test to pick up, rather than
+        # the test generating its own after the file would already need to
+        # be in place.
+        TEST_SOURCE_ID="CIRESCANTEST$(openssl rand -hex 4)"
+        echo "TEST_SOURCE_ID=$TEST_SOURCE_ID" >> $GITHUB_ENV
+
+        # Layout is {datadir}/{user}/files/{path} relative to the configured
+        # `datadirectory`, which defaults to {bind mount root}/files (confirmed
+        # via `occ config:system:get datadirectory`) -- "/mnt/data" is the
+        # bind mount's target path inside the container (see docker-compose.yaml's
+        # owncloud service), not OWNCLOUD_DATA_PATH, which is the host-side path.
+        DEST_DIR="/mnt/data/files/${{ env.OWNCLOUD_USER_ID }}/files/${{ env.SAVE_PATH }}/$TEST_SOURCE_ID/TAROT-TCA"
+        docker exec owncloud_server mkdir -p "$DEST_DIR"
+        docker cp skyportal_processor_service/tests/fixtures/test_image.fits "owncloud_server:$DEST_DIR/test_image.fits"
+
+        # OwnCloud indexes files into a DB-backed cache separate from the raw
+        # filesystem, so a files:scan is still needed for WebDAV/PROPFIND
+        # (what comment_watcher.py reads with) to see it.
+        docker exec owncloud_server occ files:scan "${{ env.OWNCLOUD_USER_ID }}"
 
     - name: Run comment watcher integration test
       run: |
