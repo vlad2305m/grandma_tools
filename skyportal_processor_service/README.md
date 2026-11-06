@@ -33,7 +33,10 @@ Required packages:
 
 ## Configuration
 
-See `.env.default` for the full list of environment variables. Notably:
+See `.env.default` for the full list of environment variables, and
+`SETUP.md` for what to register (bot accounts, permissions, the
+`grandma_rescan` Analysis Service) on an existing SkyPortal/StdWeb/OwnCloud
+deployment before pointing this service at it. Notably:
 
 * `TELESCOPE_INSTRUMENT_MAP` (required): JSON object mapping each OwnCloud
   telescope folder name (the path segment right after the source folder,
