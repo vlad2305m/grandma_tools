@@ -73,6 +73,19 @@ jobs:
         cd stdweb
         git apply ../skyportal_processor_service/stdweb-ci/local_catalog.patch
 
+    - name: Patch SkyPortal docker.yaml for the externally-published port
+      run: |
+        # server.port is used only to build externally-facing URLs (e.g. the
+        # analysis webhook callback_url -- see get_app_base_url in
+        # skyportal/utils/app.py), not the actual internal bind (ports.app,
+        # left at 5000, matching nginx's real listen port). Default (5000)
+        # is wrong here: SkyPortal is reached from outside the container at
+        # 9000 (see docker-compose.yaml's "9000:5000" mapping), and
+        # comment_watcher.py -- which runs on the CI runner itself, not in
+        # the compose network -- needs a callback_url it can actually reach.
+        sed -i 's/^  port: 5000 # Internal port$/  port: 9000 # Externally-published port (see docker-compose.yaml'"'"'s 9000:5000 mapping)/' skyportal/docker.yaml
+        grep -A1 "^server:" skyportal/docker.yaml
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
@@ -228,6 +241,12 @@ jobs:
         SOURCE_TAG=${{ env.SOURCE_TAG }}
         SKYPORTAL_COMMAND=${{ env.SKYPORTAL_COMMAND }}
         START_TIME=${{ env.START_TIME }}
+        # Activates the "Run Analysis" webhook trigger path (see
+        # test_analysis_triggers_rescan_and_photometry) -- comment_watcher.py
+        # runs on the runner itself, not in the compose network, so
+        # SkyPortal's container reaches back out to it via
+        # host.docker.internal (see docker-compose.yaml's web service).
+        WEBHOOK_URL=http://host.docker.internal:8765
         EOF
         echo "Environment file created"
 
@@ -295,7 +314,9 @@ jobs:
         # host-path write from Python + `sudo chmod -R a+rwX` on the whole
         # tree. SOURCE_ID has to be known up front for the destination path,
         # so it's generated here and exported as TEST_SOURCE_ID for the test
-        # to pick up.
+        # to pick up; one source per trigger path under test (see
+        # TEST_SOURCE_SUFFIXES in test_integration_comment_watcher.py) so
+        # they don't share mutable state and can run concurrently.
         TEST_SOURCE_ID="CIRESCANTEST$(openssl rand -hex 4)"
         echo "TEST_SOURCE_ID=$TEST_SOURCE_ID" >> $GITHUB_ENV
 
@@ -304,20 +325,26 @@ jobs:
         # via `occ config:system:get datadirectory`) -- "/mnt/data" is the
         # bind mount's target path inside the container (see docker-compose.yaml's
         # owncloud service), not OWNCLOUD_DATA_PATH, which is the host-side path.
-        DEST_DIR="/mnt/data/files/${{ env.OWNCLOUD_USER_ID }}/files/${{ env.SAVE_PATH }}/$TEST_SOURCE_ID/TAROT-TCA"
-        docker exec owncloud_server mkdir -p "$DEST_DIR"
-        docker cp skyportal_processor_service/tests/fixtures/test_image.fits "owncloud_server:$DEST_DIR/test_image.fits"
+        for suffix in COMMENT ANALYSIS; do
+          DEST_DIR="/mnt/data/files/${{ env.OWNCLOUD_USER_ID }}/files/${{ env.SAVE_PATH }}/${TEST_SOURCE_ID}-${suffix}/TAROT-TCA"
+          docker exec owncloud_server mkdir -p "$DEST_DIR"
+          docker cp skyportal_processor_service/tests/fixtures/test_image.fits "owncloud_server:$DEST_DIR/test_image.fits"
+        done
 
         # OwnCloud indexes files into a DB-backed cache separate from the raw
         # filesystem, so a files:scan is still needed for WebDAV/PROPFIND
-        # (what comment_watcher.py reads with) to see it.
+        # (what comment_watcher.py reads with) to see it. One scan covers
+        # both paths seeded above.
         docker exec owncloud_server occ files:scan "${{ env.OWNCLOUD_USER_ID }}"
 
     - name: Run comment watcher integration test
       run: |
         cd skyportal_processor_service/tests
         echo "Running pytest against the live comment watcher..."
-        python -m pytest test_integration_comment_watcher.py -v -s
+        # -n 2: the comment- and analysis-triggered tests use separate
+        # sources and have no shared mutable state, so they run concurrently
+        # against the one live comment_watcher.py/StdWeb/SkyPortal stack.
+        python -m pytest test_integration_comment_watcher.py -v -s -n 2
         echo "Integration test completed"
 
     - name: Stop comment watcher

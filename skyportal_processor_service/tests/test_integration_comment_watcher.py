@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 load_dotenv("../.env")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from comment_watcher import RESCAN_SERVICE_NAME  # noqa: E402
+from comment_watcher import RESCAN_SERVICE_NAME, RESCAN_TRIGGER_SERVICE_NAME  # noqa: E402
 
 # OwnCloud's on-disk data directory, as bind-mounted by docker-compose.yaml.
 # Used only by seed_owncloud_file()'s local-run fallback below -- CI places
@@ -41,13 +41,23 @@ FIXTURE_PATH = os.path.join(os.path.dirname(__file__), "fixtures", "test_image.f
 FIXTURE_RA = 244.000112892
 FIXTURE_DEC = 22.2673593981
 
-# CI's "Seed OwnCloud fixture file" step generates this and places the
-# fixture file under it (via `docker cp`, not this test) before pytest runs
-# -- it has to know the id up front to pick a destination path. Falls back
-# to a locally-generated one for standalone/local runs, where
-# seed_owncloud_file() below does the equivalent placement itself.
-SOURCE_ID = os.getenv("TEST_SOURCE_ID") or f"CIRESCANTEST{uuid.uuid4().hex[:8]}"
+# CI's "Seed OwnCloud fixture file" step generates this and seeds the fixture
+# file for every id in TEST_SOURCE_SUFFIXES below (via `docker cp`, not this
+# test) before pytest runs -- it has to know the ids up front to pick
+# destination paths. Falls back to a locally-generated base for
+# standalone/local runs, where seed_owncloud_file() below does the
+# equivalent placement itself.
+BASE_SOURCE_ID = os.getenv("TEST_SOURCE_ID") or f"CIRESCANTEST{uuid.uuid4().hex[:8]}"
 TELESCOPE_FOLDER = "TAROT-TCA"
+
+# One source per trigger path under test, all sharing the one fixture image
+# (same real field/catalogue data, just two independent source rows so the
+# two tests below don't share mutable state and can run concurrently -- see
+# skyportal_processor_service_ci.yaml's `pytest -n` invocation). Add another
+# suffix here (and a matching test) for further trigger paths.
+TEST_SOURCE_SUFFIXES = ["COMMENT", "ANALYSIS"]
+COMMENT_SOURCE_ID = f"{BASE_SOURCE_ID}-COMMENT"
+ANALYSIS_SOURCE_ID = f"{BASE_SOURCE_ID}-ANALYSIS"
 
 
 def seed_owncloud_file(relative_path, fixture_path):
@@ -97,9 +107,9 @@ def post_comment(source_id, text):
     response.raise_for_status()
 
 
-def get_comments():
+def get_comments(source_id):
     response = requests.get(
-        f"{SKYPORTAL_URL}/api/sources/{SOURCE_ID}/comments",
+        f"{SKYPORTAL_URL}/api/sources/{source_id}/comments",
         headers=SKYPORTAL_HEADERS,
     )
     response.raise_for_status()
@@ -114,6 +124,12 @@ def self_user_id():
     return response.json()["data"]["id"]
 
 
+def get_service_id(name):
+    response = requests.get(f"{SKYPORTAL_URL}/api/analysis_service", headers=SKYPORTAL_HEADERS)
+    response.raise_for_status()
+    return next(s["id"] for s in response.json()["data"] if s["name"] == name)
+
+
 def get_ledger(source_id):
     """
     Fetch the current processed/failed file ledger for a source directly from
@@ -122,12 +138,7 @@ def get_ledger(source_id):
     out of a bot reply comment. Mirrors restore_ledger's own "latest
     completed entry" logic.
     """
-    response = requests.get(f"{SKYPORTAL_URL}/api/analysis_service", headers=SKYPORTAL_HEADERS)
-    response.raise_for_status()
-    service_id = next(
-        s["id"] for s in response.json()["data"] if s["name"] == RESCAN_SERVICE_NAME
-    )
-
+    service_id = get_service_id(RESCAN_SERVICE_NAME)
     response = requests.get(
         f"{SKYPORTAL_URL}/api/obj/{source_id}/analysis",
         headers=SKYPORTAL_HEADERS,
@@ -148,23 +159,36 @@ def get_ledger(source_id):
 
 
 @pytest.fixture(scope="module", autouse=True)
-def seed_source_and_file():
-    """Real SkyPortal source at the fixture's coordinates, with the fixture FITS
-    already sitting in the OwnCloud folder comment_watcher.py scans for it."""
-    response = requests.post(
-        f"{SKYPORTAL_URL}/api/sources",
-        json={"id": SOURCE_ID, "ra": FIXTURE_RA, "dec": FIXTURE_DEC, "group_ids": [1]},
-        headers=SKYPORTAL_HEADERS,
-    )
-    response.raise_for_status()
-
-    if not os.getenv("TEST_SOURCE_ID"):
-        # Standalone/local run: CI's "Seed OwnCloud fixture file" step didn't
-        # already place it (TEST_SOURCE_ID unset means SOURCE_ID above was
-        # generated locally), so do it here instead.
-        seed_owncloud_file(
-            f"{SAVE_PATH}/{SOURCE_ID}/{TELESCOPE_FOLDER}/test_image.fits", FIXTURE_PATH
+def seed_sources_and_files():
+    """Real SkyPortal sources at the fixture's coordinates (one per
+    TEST_SOURCE_SUFFIXES entry), each with the fixture FITS already sitting
+    in the OwnCloud folder comment_watcher.py scans for it."""
+    for source_id in (COMMENT_SOURCE_ID, ANALYSIS_SOURCE_ID):
+        response = requests.post(
+            f"{SKYPORTAL_URL}/api/sources",
+            json={"id": source_id, "ra": FIXTURE_RA, "dec": FIXTURE_DEC, "group_ids": [1]},
+            headers=SKYPORTAL_HEADERS,
         )
+        if response.status_code == 400:
+            # This fixture runs once per pytest-xdist worker process (each
+            # imports the test module independently), and every worker seeds
+            # both sources regardless of which test it actually runs -- so
+            # two workers can race to insert the same new source id. Treat
+            # "already exists" as success rather than a real failure.
+            check = requests.get(
+                f"{SKYPORTAL_URL}/api/sources/{source_id}", headers=SKYPORTAL_HEADERS
+            )
+            if check.status_code == 200:
+                continue
+        response.raise_for_status()
+
+        if not os.getenv("TEST_SOURCE_ID"):
+            # Standalone/local run: CI's "Seed OwnCloud fixture file" step didn't
+            # already place it (TEST_SOURCE_ID unset means BASE_SOURCE_ID above
+            # was generated locally), so do it here instead.
+            seed_owncloud_file(
+                f"{SAVE_PATH}/{source_id}/{TELESCOPE_FOLDER}/test_image.fits", FIXTURE_PATH
+            )
 
     yield
     # No cleanup: this only runs against ephemeral CI containers (owncloud,
@@ -172,11 +196,11 @@ def seed_source_and_file():
     # after the test job finishes.
 
 
-def wait_for_reply(after_comment_id, timeout=240, interval=5):
+def wait_for_reply(source_id, after_comment_id, timeout=240, interval=5):
     """Poll until comment_watcher.py's bot reply lands on the thread."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        for comment in get_comments():
+        for comment in get_comments(source_id):
             if (
                 comment["id"] > after_comment_id
                 and comment.get("bot") is True
@@ -184,7 +208,30 @@ def wait_for_reply(after_comment_id, timeout=240, interval=5):
             ):
                 return comment
         time.sleep(interval)
-    raise TimeoutError(f"No rescan reply for {SOURCE_ID} within {timeout}s")
+    raise TimeoutError(f"No rescan reply for {source_id} within {timeout}s")
+
+
+def wait_for_analysis_completion(source_id, service_id, after_id=0, timeout=240, interval=5):
+    """
+    Poll for a new "completed"/"failure" ObjAnalysis entry. Webhook-triggered
+    jobs (job.callback_url set in comment_watcher.py) don't post a reply
+    comment -- they report back via send_webhook_callback, which SkyPortal
+    records as an entry here instead; this is that path's equivalent of
+    wait_for_reply.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        response = requests.get(
+            f"{SKYPORTAL_URL}/api/obj/{source_id}/analysis",
+            headers=SKYPORTAL_HEADERS,
+            params={"analysisServiceID": service_id},
+        )
+        response.raise_for_status()
+        for entry in response.json()["data"]:
+            if entry["id"] > after_id and entry.get("status") in ("completed", "failure"):
+                return entry
+        time.sleep(interval)
+    raise TimeoutError(f"No analysis completion for {source_id} within {timeout}s")
 
 
 def wait_for_task_state(task_id, states, timeout=240, interval=5):
@@ -204,6 +251,33 @@ def wait_for_task_state(task_id, states, timeout=240, interval=5):
     )
 
 
+def assert_file_processed(source_id):
+    """
+    Shared post-condition for both trigger paths below: exactly the fixture
+    file processed, the StdWeb task it spawned finished successfully, and the
+    resulting photometry point actually landed on the SkyPortal source (not
+    merely claimed processed by a bookkeeping bug).
+    """
+    file_path = f"{source_id}/{TELESCOPE_FOLDER}/test_image.fits"
+    ledger = get_ledger(source_id)
+    assert ledger["processed_files"] == [file_path], ledger
+    assert ledger["failed_files"] == [], ledger
+    file_detail = ledger["file_details"].get(file_path)
+    assert file_detail is not None and file_detail["status"] == "processed", ledger
+    stdweb_id = file_detail["stdweb_id"]
+
+    final_state = wait_for_task_state(stdweb_id, {"photometry_done", "failed"})
+    assert final_state == "photometry_done"
+
+    response = requests.get(
+        f"{SKYPORTAL_URL}/api/sources/{source_id}/photometry", headers=SKYPORTAL_HEADERS
+    )
+    response.raise_for_status()
+    photometry = response.json()["data"]
+    matching = [p for p in photometry if p.get("origin") == f"stdweb:{stdweb_id}"]
+    assert matching, f"No SkyPortal photometry point with origin stdweb:{stdweb_id}"
+
+
 def test_comment_triggers_rescan_and_photometry():
     """
     End-to-end contract: a plain (non-command) comment from a user other than
@@ -214,9 +288,9 @@ def test_comment_triggers_rescan_and_photometry():
     see "any comment not from SELF_USER_ID triggers a rescan" and stage 7 in
     comment_watcher.py.
     """
-    before_ids = {c["id"] for c in get_comments()}
-    post_comment(SOURCE_ID, "please check for new data")
-    new_comments = [c for c in get_comments() if c["id"] not in before_ids]
+    before_ids = {c["id"] for c in get_comments(COMMENT_SOURCE_ID)}
+    post_comment(COMMENT_SOURCE_ID, "please check for new data")
+    new_comments = [c for c in get_comments(COMMENT_SOURCE_ID) if c["id"] not in before_ids]
     assert new_comments, "comment did not appear via the API"
     trigger = new_comments[0]
     assert trigger["author_id"] != self_user_id(), (
@@ -225,30 +299,47 @@ def test_comment_triggers_rescan_and_photometry():
     )
     comment_id = trigger["id"]
 
-    reply = wait_for_reply(comment_id)
+    reply = wait_for_reply(COMMENT_SOURCE_ID, comment_id)
     assert "1 new file(s) processed and uploaded to SkyPortal" in reply["text"], reply["text"]
     assert "0 new file(s) failed" in reply["text"], reply["text"]
 
-    file_path = f"{SOURCE_ID}/{TELESCOPE_FOLDER}/test_image.fits"
-    ledger = get_ledger(SOURCE_ID)
-    assert ledger["processed_files"] == [file_path], ledger
-    assert ledger["failed_files"] == [], ledger
-    file_detail = ledger["file_details"].get(file_path)
-    assert file_detail is not None and file_detail["status"] == "processed", ledger
-    stdweb_id = file_detail["stdweb_id"]
+    assert_file_processed(COMMENT_SOURCE_ID)
 
-    final_state = wait_for_task_state(
-        stdweb_id, {"photometry_done", "failed"}
-    )
-    assert final_state == "photometry_done"
 
-    # Cross-check against SkyPortal directly: the photometry point comment_watcher.py
-    # reports as "uploaded" must actually be attached to the source, not merely
-    # claimed by a bookkeeping bug in the reply message.
+def test_analysis_triggers_rescan_and_photometry():
+    """
+    End-to-end contract for the other trigger path: SkyPortal's own "Run
+    Analysis" button/API (POST /api/obj/<source_id>/analysis/<id>) against
+    the separate grandma_rescan_trigger Analysis Service runs the same
+    pipeline as a comment, without posting one -- see
+    WebhookHandler/send_webhook_callback in comment_watcher.py. The actual
+    ledger (checked below via assert_file_processed) is still written to the
+    main grandma_rescan service, same as a comment-triggered run -- see
+    save_ledger. Needs WEBHOOK_URL configured (see
+    skyportal_processor_service_ci.yaml's "Create test environment file");
+    skipped if it isn't, since there's then no registered trigger service
+    for SkyPortal to call.
+    """
+    if not os.getenv("WEBHOOK_URL"):
+        pytest.skip("WEBHOOK_URL not configured -- analysis-triggered path is inactive")
+
+    service_id = get_service_id(RESCAN_TRIGGER_SERVICE_NAME)
     response = requests.get(
-        f"{SKYPORTAL_URL}/api/sources/{SOURCE_ID}/photometry", headers=SKYPORTAL_HEADERS
+        f"{SKYPORTAL_URL}/api/obj/{ANALYSIS_SOURCE_ID}/analysis",
+        headers=SKYPORTAL_HEADERS,
+        params={"analysisServiceID": service_id},
     )
     response.raise_for_status()
-    photometry = response.json()["data"]
-    matching = [p for p in photometry if p.get("origin") == f"stdweb:{stdweb_id}"]
-    assert matching, f"No SkyPortal photometry point with origin stdweb:{stdweb_id}"
+    before_id = max((e["id"] for e in response.json()["data"]), default=0)
+
+    response = requests.post(
+        f"{SKYPORTAL_URL}/api/obj/{ANALYSIS_SOURCE_ID}/analysis/{service_id}",
+        json={},
+        headers=SKYPORTAL_HEADERS,
+    )
+    response.raise_for_status()
+
+    entry = wait_for_analysis_completion(ANALYSIS_SOURCE_ID, service_id, after_id=before_id)
+    assert entry["status"] == "completed", entry
+
+    assert_file_processed(ANALYSIS_SOURCE_ID)

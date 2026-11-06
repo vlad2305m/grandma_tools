@@ -38,16 +38,25 @@ jobformat_version = 0.2
 # numeric depth is used instead; the server naturally stops at the actual tree depth.
 OWNCLOUD_SCAN_DEPTH = 10
 
-# Analysis Service that's both runnable (SkyPortal's "Run Analysis" button
-# triggers a rescan via a webhook, same as any comment does) and the storage
-# for each source's processed/failed file ledger (replaces the old mechanism
-# of embedding job state as hidden unicode variation selectors appended to
-# every bot reply comment and decoding/unioning them back on restart).
-# Created once per SkyPortal instance -- see get_or_create_rescan_service.
-# Webhook-runnable only if WEBHOOK_URL is configured; upload_only (ledger
-# storage only, as before) otherwise -- see get_or_create_rescan_service.
+# Analysis Service that stores each source's processed/failed file ledger
+# (replaces the old mechanism of embedding job state as hidden unicode
+# variation selectors appended to every bot reply comment and
+# decoding/unioning them back on restart). Always upload_only=True --
+# SkyPortal's analysis_upload endpoint (what save_ledger posts to) rejects
+# anything else, so this service can't double as the webhook trigger below;
+# see RESCAN_TRIGGER_SERVICE_NAME for that. Created once per SkyPortal
+# instance -- see get_or_create_rescan_service.
 RESCAN_SERVICE_NAME = "grandma_rescan"
 RESCAN_SERVICE_ID: int = -1  # resolved once at startup
+
+# Separate Analysis Service for SkyPortal's "Run Analysis" button (a webhook
+# trigger, same effect as any comment) -- only created/managed when
+# WEBHOOK_URL is configured; see get_or_create_trigger_service. Its own
+# ObjAnalysis entries are just SkyPortal's UI feedback for that button; the
+# actual ledger is always written to RESCAN_SERVICE_ID by save_ledger,
+# regardless of which path triggered the run (see pipeline_tick).
+RESCAN_TRIGGER_SERVICE_NAME = "grandma_rescan_trigger"
+RESCAN_TRIGGER_SERVICE_ID: int = -1  # resolved once at startup if WEBHOOK_URL is set
 
 # Webhook-triggered RescanJobs land here (from WebhookHandler.do_POST, which
 # runs on the HTTP server's own thread) and are drained into `pipeline` at the
@@ -119,13 +128,12 @@ class RescanJob:
 pipeline: List[RescanJob] = []
 
 
-def get_or_create_rescan_service() -> int:
+def _get_or_create_service(name: str, display_name: str, description: str, desired: dict) -> int:
     """
-    Find the RESCAN_SERVICE_NAME Analysis Service, or create it if this is the
-    first run against this SkyPortal instance; update it if WEBHOOK_URL's
-    presence/absence no longer matches how it's currently configured there
-    (e.g. it's being turned on or off for an existing deployment). Called
-    once at startup.
+    Find the named Analysis Service, or create it if this is the first run
+    against this SkyPortal instance; update it if `desired` no longer
+    matches how it's currently configured there. Shared by
+    get_or_create_rescan_service and get_or_create_trigger_service.
 
     Finding it only needs an ordinary token (GET is unrestricted); creating
     or updating it needs the "Manage Analysis Services" ACL, which
@@ -136,39 +144,26 @@ def get_or_create_rescan_service() -> int:
     warn and keep using it as currently configured there -- this only matters
     if WEBHOOK_URL was just added or removed.
     """
-    desired = {
-        "upload_only": not bool(WEBHOOK_URL),
-        "url": f"{WEBHOOK_URL}/trigger" if WEBHOOK_URL else f"{INSTANCE_URL}/not-a-real-analysis-endpoint",
-        "display_on_resource_dropdown": bool(WEBHOOK_URL),
-    }
-
     response = requests.get(f"{INSTANCE_URL}/api/analysis_service", headers=header)
     response.raise_for_status()
     for service in response.json()["data"]:
-        if service["name"] == RESCAN_SERVICE_NAME:
+        if service["name"] == name:
             if any(service.get(k) != v for k, v in desired.items()):
                 patch = requests.patch(
                     f"{INSTANCE_URL}/api/analysis_service/{service['id']}", headers=header, json=desired
                 )
                 if patch.status_code != 200:
                     logger.warning(
-                        f"Could not update {RESCAN_SERVICE_NAME!r} to match the current WEBHOOK_URL "
+                        f"Could not update {name!r} to match the current WEBHOOK_URL "
                         f"config (needs \"Manage Analysis Services\"); leaving it as currently configured "
                         f"on SkyPortal. Server response: {patch.status_code} {patch.text}"
                     )
             return service["id"]
 
     create_payload = {
-        "name": RESCAN_SERVICE_NAME,
-        "display_name": "GRANDMA Rescan",
-        "description": (
-            "Rescans a source's OwnCloud folder for new FITS files, runs StdWeb "
-            "forced photometry on each, and uploads the result to SkyPortal -- "
-            "the same thing any comment on the source already triggers. Click "
-            '"Run Analysis" to trigger it directly, without posting a comment. '
-            "Also used internally to persist the per-source processed/failed "
-            "file ledger across runs."
-        ),
+        "name": name,
+        "display_name": display_name,
+        "description": description,
         "authentication_type": "none",
         "analysis_type": "meta_analysis",
         "input_data_types": [],
@@ -180,7 +175,7 @@ def get_or_create_rescan_service() -> int:
     response = requests.post(f"{INSTANCE_URL}/api/analysis_service", headers=header, json=create_payload)
     if response.status_code != 200:
         raise RuntimeError(
-            f"Analysis service {RESCAN_SERVICE_NAME!r} doesn't exist yet and SKYPORTAL_TOKEN can't "
+            f"Analysis service {name!r} doesn't exist yet and SKYPORTAL_TOKEN can't "
             f"create it (needs the \"Manage Analysis Services\" ACL -- ordinary \"Run Analyses\" isn't "
             f"enough). Ask a SkyPortal admin to POST this once to {INSTANCE_URL}/api/analysis_service "
             f"(with their own, more privileged token), then restart this service:\n"
@@ -190,18 +185,69 @@ def get_or_create_rescan_service() -> int:
     return response.json()["data"]["id"]
 
 
+def get_or_create_rescan_service() -> int:
+    """
+    Find or create RESCAN_SERVICE_NAME: the permanent, always upload_only
+    ledger-storage service save_ledger/restore_ledger/prune_ledger_entries
+    use, regardless of which path (comment or webhook) triggered a run.
+    Called once at startup, unconditionally.
+    """
+    return _get_or_create_service(
+        RESCAN_SERVICE_NAME,
+        "GRANDMA Rescan Ledger",
+        (
+            "Stores each source's processed/failed file ledger for the GRANDMA "
+            "rescan pipeline (any comment on a source, or the separate "
+            '"GRANDMA Rescan (Run Analysis)" service if configured, triggers a '
+            "run that writes here). upload_only: not meant to be run directly."
+        ),
+        desired={
+            "upload_only": True,
+            "url": f"{INSTANCE_URL}/not-a-real-analysis-endpoint",
+            "display_on_resource_dropdown": False,
+        },
+    )
+
+
+def get_or_create_trigger_service() -> int:
+    """
+    Find or create RESCAN_TRIGGER_SERVICE_NAME: the "Run Analysis" webhook
+    entry point, only called when WEBHOOK_URL is configured. Deliberately a
+    separate service from RESCAN_SERVICE_NAME -- SkyPortal's analysis_upload
+    endpoint (what save_ledger posts to) only works against an upload_only
+    service, so one service can't be both the ledger store and this
+    not-upload_only trigger at once.
+    """
+    return _get_or_create_service(
+        RESCAN_TRIGGER_SERVICE_NAME,
+        "GRANDMA Rescan (Run Analysis)",
+        (
+            "Rescans a source's OwnCloud folder for new FITS files, runs StdWeb "
+            "forced photometry on each, and uploads the result to SkyPortal -- "
+            "the same thing any comment on the source already triggers. Click "
+            '"Run Analysis" to trigger it directly, without posting a comment.'
+        ),
+        desired={
+            "upload_only": False,
+            "url": f"{WEBHOOK_URL}/trigger",
+            "display_on_resource_dropdown": True,
+        },
+    )
+
+
 def restore_ledger(source_id: str) -> Tuple[List[str], List[str], Dict[str, dict]]:
     """
     Recover (processed_files, failed_files, file_details) for a source from its
-    most recent *completed* ledger entry against RESCAN_SERVICE_ID (either a
-    save_ledger upload, or a successfully-finished webhook-triggered run --
-    see WebhookHandler/send_webhook_callback). Empty/default if the source has
-    never had one.
+    most recent *completed* entry against RESCAN_SERVICE_ID -- a save_ledger
+    upload, written the same way regardless of which path (comment or
+    webhook) triggered the run that produced it; see pipeline_tick. Empty/
+    default if the source has never had one.
 
-    Only "completed" entries count: an in-flight ("queued"/"pending") or
-    failed webhook-triggered run can share analysisServiceID with real ledger
-    entries, and must not look like "this source has no ledger yet" to a
-    rescan that happens to restore concurrently -- see prune_ledger_entries.
+    Only "completed" entries count: an in-flight or failed upload shouldn't
+    normally exist here (save_ledger always uploads with status "completed"
+    immediately), but a stale leftover must not look like "this source has
+    no ledger yet" to a rescan that happens to restore concurrently -- see
+    prune_ledger_entries.
 
     Replaces the old mechanism of decoding hidden unicode variation selectors
     appended to every bot reply comment and unioning the result across all of
@@ -236,20 +282,20 @@ def restore_ledger(source_id: str) -> Tuple[List[str], List[str], Dict[str, dict
     )
 
 
-def prune_ledger_entries(source_id: str) -> None:
+def prune_ledger_entries(source_id: str, service_id: int) -> None:
     """
-    Delete every ObjAnalysis entry for this source against RESCAN_SERVICE_ID
-    except the newest (by id) -- keeps at most one at all times, regardless of
-    whether entries came from save_ledger uploads or webhook-triggered runs,
-    well under SkyPortal's analysis_services.max_analysis_per_obj_per_user
-    cap. Called after every completion (see save_ledger/send_webhook_callback).
+    Delete every ObjAnalysis entry for this source against `service_id`
+    except the newest (by id) -- keeps at most one at all times, well under
+    SkyPortal's analysis_services.max_analysis_per_obj_per_user cap. Called
+    after every completion against both RESCAN_SERVICE_ID (see save_ledger)
+    and RESCAN_TRIGGER_SERVICE_ID (see send_webhook_callback) separately.
     Safe without locking/transactions: only one instance of this service runs
     at a time.
     """
     response = requests.get(
         f"{INSTANCE_URL}/api/obj/{source_id}/analysis",
         headers=header,
-        params={"analysisServiceID": RESCAN_SERVICE_ID},
+        params={"analysisServiceID": service_id},
     )
     response.raise_for_status()
     entries = sorted(response.json()["data"], key=lambda e: e["id"])
@@ -260,10 +306,13 @@ def prune_ledger_entries(source_id: str) -> None:
 def save_ledger(job: RescanJob) -> None:
     """
     Upload the current cumulative processed/failed file ledger for job.source_id
-    as a new ObjAnalysis entry (status "completed" immediately), then prune
-    every older entry for this source -- see prune_ledger_entries. Used for
-    comment-triggered jobs; a webhook-triggered job's completion callback
-    (see send_webhook_callback) plays the same role instead.
+    as a new ObjAnalysis entry against RESCAN_SERVICE_ID (status "completed"
+    immediately), then prune every older entry for this source -- see
+    prune_ledger_entries. Called for every job regardless of trigger path
+    (see pipeline_tick) -- this is the single source of truth restore_ledger
+    reads back from; send_webhook_callback's own ObjAnalysis entry (against
+    the separate RESCAN_TRIGGER_SERVICE_ID) is just SkyPortal's "Run
+    Analysis" UI feedback, not read back from here.
     """
     payload = {
         "message": f"{len(job.processed_files)} processed, {len(job.failed_files)} failed (as of job #{job.job_id})",
@@ -289,7 +338,7 @@ def save_ledger(job: RescanJob) -> None:
         json=payload,
     )
     response.raise_for_status()
-    prune_ledger_entries(job.source_id)
+    prune_ledger_entries(job.source_id, RESCAN_SERVICE_ID)
 
 
 def send_webhook_callback(job: RescanJob) -> None:
@@ -299,9 +348,12 @@ def send_webhook_callback(job: RescanJob) -> None:
     a comment. Matches the contract at https://skyportal.io/docs/analysis.html:
     POST {"status", "message", "analysis": {"results": {...}}} to the
     callback_url embedded in the original trigger request; SkyPortal records
-    this as a "completed" (success) or "failure" ObjAnalysis entry, which
-    restore_ledger then reads the same way it reads a save_ledger upload. The
-    callback token is single-use, so this always fires exactly once per run.
+    this as a "completed" (success) or "failure" ObjAnalysis entry against
+    RESCAN_TRIGGER_SERVICE_ID -- purely UI feedback for that button, not what
+    restore_ledger reads (save_ledger, called unconditionally in
+    pipeline_tick regardless of trigger path, is the actual ledger write).
+    The callback token is single-use, so this always fires exactly once per
+    run.
     """
     status = "success" if job.stage == 1000 else "failure"
     payload = {
@@ -325,7 +377,7 @@ def send_webhook_callback(job: RescanJob) -> None:
         traceback.print_exc()
         logger.error(f"Could not deliver webhook callback for job #{job.job_id} ({job.source_id})")
         return
-    prune_ledger_entries(job.source_id)
+    prune_ledger_entries(job.source_id, RESCAN_TRIGGER_SERVICE_ID)
 
 
 def get_new_comments(
@@ -815,8 +867,8 @@ def pipeline_tick_all() -> None:
 
 class WebhookHandler(BaseHTTPRequestHandler):
     """
-    Receives SkyPortal's "Run Analysis" webhook call for RESCAN_SERVICE_ID
-    (see get_or_create_rescan_service/run_webhook_server) and turns it into a
+    Receives SkyPortal's "Run Analysis" webhook call for RESCAN_TRIGGER_SERVICE_ID
+    (see get_or_create_trigger_service/run_webhook_server) and turns it into a
     RescanJob on trigger_queue, same as a comment does for get_new_comments.
     Runs on its own thread -- see run_webhook_server -- so it never touches
     `pipeline` directly (that's main_loop's job, draining trigger_queue).
@@ -862,7 +914,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
 def run_webhook_server(host: str, port: int) -> None:
     """
     Starts the "Run Analysis" webhook listener on a daemon thread. Only
-    called when WEBHOOK_URL is configured -- see get_or_create_rescan_service
+    called when WEBHOOK_URL is configured -- see get_or_create_trigger_service
     and the startup block below.
     """
     server = ThreadingHTTPServer((host, port), WebhookHandler)
@@ -975,8 +1027,8 @@ if __name__ == "__main__":
         # Externally-reachable base URL for this process's own HTTP listener
         # (e.g. "http://100.90.108.127:8765"), so SkyPortal's "Run Analysis"
         # button can trigger a rescan directly, not just via a comment -- see
-        # WebhookHandler/get_or_create_rescan_service. Unset (default): the
-        # service stays upload_only (ledger storage only, as before).
+        # WebhookHandler/get_or_create_trigger_service. Unset (default): the
+        # separate RESCAN_TRIGGER_SERVICE_NAME service is never created.
         WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
         WEBHOOK_LISTEN_HOST = os.getenv("WEBHOOK_LISTEN_HOST", "0.0.0.0")
         WEBHOOK_LISTEN_PORT = int(os.getenv("WEBHOOK_LISTEN_PORT", "8765"))
@@ -1006,8 +1058,10 @@ if __name__ == "__main__":
 
     try:
         RESCAN_SERVICE_ID = get_or_create_rescan_service()
+        if WEBHOOK_URL:
+            RESCAN_TRIGGER_SERVICE_ID = get_or_create_trigger_service()
     except Exception as e:
-        logger.error(f"Could not find or create the {RESCAN_SERVICE_NAME!r} analysis service: {e}")
+        logger.error(f"Could not find or create the {RESCAN_SERVICE_NAME!r}/{RESCAN_TRIGGER_SERVICE_NAME!r} analysis service: {e}")
         exit(1)
     if WEBHOOK_URL:
         run_webhook_server(WEBHOOK_LISTEN_HOST, WEBHOOK_LISTEN_PORT)

@@ -51,16 +51,17 @@ uploads are explicitly shared with these groups, so ledger entries stay
 readable by the bot even if its own personal group memberships change
 later.
 
-**Analysis Service registration** (`grandma_rescan`): on first startup,
-the service looks for an Analysis Service named `grandma_rescan` and
-creates it if missing (needs `Manage Analysis Services`, above). If the
+**Analysis Service registration** (`grandma_rescan` / `grandma_rescan_trigger`):
+on first startup, the service looks for an Analysis Service named
+`grandma_rescan` (the per-source file ledger store -- always created) and,
+if `WEBHOOK_URL` is configured, a second one named `grandma_rescan_trigger`
+(the optional "Run Analysis" button entry point -- see "Triggering a
+rescan"/"File ledger" in `README.md` for why these are separate services),
+creating either if missing (needs `Manage Analysis Services`, above). If the
 bot token doesn't have that ACL, startup fails with a `RuntimeError`
-containing the exact JSON payload to `POST` to `/api/analysis_service` --
+containing the exact JSON payload(s) to `POST` to `/api/analysis_service` --
 have an admin run that once, with their own more-privileged token, then
-restart this service; it finds the service by name from then on. This is
-the same Analysis Service that backs both the per-source file ledger and
-(if `WEBHOOK_URL` is configured) the optional "Run Analysis" trigger
-button -- see "Triggering a rescan" in `README.md`.
+restart this service; it finds the service(s) by name from then on.
 
 **API token**: generate a token for the bot user (Profile → Generate New
 Token, or `POST /api/internal/tokens`). A token carries its own explicit
