@@ -1,0 +1,16 @@
+--- a/stdweb/processing/photometry.py	2026-11-06 08:40:13.157081777 +0100
++++ b/stdweb/processing/photometry.py	2026-11-06 08:52:52.352367009 +0100
+@@ -1341,7 +1341,12 @@
+ 
+     # Round the coordinates a bit to optimize consecutive calls to Vizier after WCS refinement
+     ra00,dec00,sr00 = round_coords_to_grid(ra0, dec0, sr0)
+-    cat = catalogs.get_cat_vizier(ra00, dec00, sr00, config['cat_name'], filters=filters, verbose=verbose)
++    local_cat_file = os.getenv('STDWEB_LOCAL_CATALOG_FILE')
++    if local_cat_file:
++        cat = Table.read(local_cat_file)
++        log(f"Using local catalogue from {local_cat_file}")
++    else:
++        cat = catalogs.get_cat_vizier(ra00, dec00, sr00, config['cat_name'], filters=filters, verbose=verbose)
+ 
+     if not cat or not len(cat):
+         raise RuntimeError('Cannot get catalogue stars')

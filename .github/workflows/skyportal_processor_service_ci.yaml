@@ -68,6 +68,11 @@ jobs:
         cp skyportal_processor_service/stdweb-ci/docker-entrypoint.sh stdweb/docker-entrypoint.sh
         cp skyportal_processor_service/stdweb-ci/.dockerignore stdweb/.dockerignore
 
+        # Adds the STDWEB_LOCAL_CATALOG_FILE escape hatch -- see
+        # stdweb-ci/README.md for why.
+        cd stdweb
+        git apply ../skyportal_processor_service/stdweb-ci/local_catalog.patch
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
@@ -102,6 +107,11 @@ jobs:
     - name: Start all services
       env:
         STDWEB_PATH: ../stdweb
+        # In-container path matching docker-compose.yaml's fixtures bind
+        # mount -- activates the STDWEB_LOCAL_CATALOG_FILE escape hatch
+        # from local_catalog.patch, so photometry calibration doesn't
+        # depend on a live VizieR query.
+        STDWEB_LOCAL_CATALOG_FILE: /data/fixtures/ps1_cat.parquet
       run: |
         # docker-compose.yaml's `web` depends on `db-init` (which creates
         # the schema) completing successfully, which itself depends on
@@ -131,6 +141,52 @@ jobs:
         timeout 300 bash -c 'until curl -sf http://localhost:9000/api/sysinfo > /dev/null; do sleep 3; done'
         echo "SkyPortal is up"
 
+    - name: Load SkyPortal demo data
+      run: |
+        cd skyportal
+        echo "Loading demo data..."
+        docker exec skyportal-web bash -c 'source /skyportal/.venv/bin/activate && FLAGS="--create_tables --config=config.yaml" make load_demo_data'
+        echo "Database initialized successfully"
+
+    - name: Extract SkyPortal token
+      id: extract_skyportal_token
+      run: |
+        cd skyportal
+        echo "Extracting SkyPortal token..."
+        SKYPORTAL_TOKEN=$(docker exec skyportal-web cat .tokens.yaml | grep "INITIAL_ADMIN:" | cut -d':' -f2 | tr -d ' ')
+
+        if [ -z "$SKYPORTAL_TOKEN" ]; then
+          echo "Failed to extract SkyPortal token"
+          exit 1
+        fi
+
+        echo "SKYPORTAL_TOKEN=$SKYPORTAL_TOKEN" >> $GITHUB_OUTPUT
+
+    - name: Configure StdWeb's SkyPortal token
+      env:
+        STDWEB_PATH: ../stdweb
+        STDWEB_LOCAL_CATALOG_FILE: /data/fixtures/ps1_cat.parquet
+        SKYPORTAL_TOKEN: ${{ steps.extract_skyportal_token.outputs.SKYPORTAL_TOKEN }}
+      run: |
+        # StdWeb's own POST /api/tasks/{id}/skyportal/ makes a direct PUT to
+        # SkyPortal using its own SKYPORTAL_TOKEN env var (see
+        # docker-compose.yaml's stdweb service) -- which isn't known until
+        # SkyPortal's own init has run, after stdweb already started. `up`
+        # recreates just this one container now that it's set; the others
+        # are already healthy and untouched (same env, same image/config).
+        # Done before StdWeb's own superuser/token creation below, since
+        # recreating the container wipes its ephemeral container-local
+        # SQLite db (see docker-compose.yaml's stdweb service comment).
+        cd skyportal_processor_service
+        echo "Recreating StdWeb with its SkyPortal token..."
+        docker compose up -d stdweb
+
+    - name: Wait for StdWeb to be ready again
+      run: |
+        echo "Waiting for StdWeb to come back up after recreation..."
+        timeout 60 bash -c 'until curl -sf http://localhost:8000/login/ > /dev/null; do sleep 2; done'
+        echo "StdWeb is up"
+
     - name: Create StdWeb superuser and API token
       id: extract_stdweb_token
       run: |
@@ -153,27 +209,6 @@ jobs:
         fi
 
         echo "STDWEB_TOKEN=$STDWEB_TOKEN" >> $GITHUB_OUTPUT
-
-    - name: Load SkyPortal demo data
-      run: |
-        cd skyportal
-        echo "Loading demo data..."
-        docker exec skyportal-web bash -c 'source /skyportal/.venv/bin/activate && FLAGS="--create_tables --config=config.yaml" make load_demo_data'
-        echo "Database initialized successfully"
-
-    - name: Extract SkyPortal token
-      id: extract_skyportal_token
-      run: |
-        cd skyportal
-        echo "Extracting SkyPortal token..."
-        SKYPORTAL_TOKEN=$(docker exec skyportal-web cat .tokens.yaml | grep "INITIAL_ADMIN:" | cut -d':' -f2 | tr -d ' ')
-
-        if [ -z "$SKYPORTAL_TOKEN" ]; then
-          echo "Failed to extract SkyPortal token"
-          exit 1
-        fi
-
-        echo "SKYPORTAL_TOKEN=$SKYPORTAL_TOKEN" >> $GITHUB_OUTPUT
 
     - name: Create second SkyPortal user
       id: create_poster_user

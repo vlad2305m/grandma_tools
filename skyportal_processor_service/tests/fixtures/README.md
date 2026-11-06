@@ -21,5 +21,27 @@ Previous fixture (replaced because its origin couldn't be traced back to a
 documented public source) was at Dec -44.1°, which forced StdWeb's catalog
 auto-selection to `skymapper` (`dec < -30`, see `stdweb`'s
 `processing/inspect.py`). This fixture's Dec (+22.27°) instead auto-selects
-`ps1` (Pan-STARRS DR1), avoiding a since-identified, unrelated third-party bug
-in the `vizier.cfa.harvard.edu` SkyMapper DR4 mirror.
+`ps1` (Pan-STARRS DR1).
+
+## `ps1_cat.parquet`
+
+Pre-fetched reference catalogue for `test_image.fits`'s field, used via the
+`STDWEB_LOCAL_CATALOG_FILE` escape hatch (see `stdweb-ci/local_catalog.patch`
+and `stdweb-ci/README.md`) so the integration test doesn't depend on a live
+VizieR query -- both the primary VizieR server and its documented fallback
+mirrors have proven unreliable from CI (persistent connection timeouts on
+`vizier.cds.unistra.fr`, and a server-side backend crash for multiple
+catalogues on `vizier.cfa.harvard.edu`/`vizier.idia.ac.za`), independent of
+which catalogue is requested.
+
+- **Source**: [MAST PanSTARRS DR2 mean-object API](https://catalogs.mast.stsci.edu/docs/panstarrs.html),
+  queried for a 0.3° cone around `test_image.fits`'s field center, filtered to
+  1215 stars with clean g/r/i/z/y PSF photometry.
+- **Schema**: raw MAST columns renamed to VizieR's `II/349/ps1` convention
+  (`RAJ2000`/`DEJ2000`/`gmag`/`e_gmag`/etc.), then run through stdpipe's own
+  `catalogs.augment_cat_bands(cat, catalog='ps1')` to add the derived
+  Johnson-Cousins columns -- byte-for-byte the same post-processing a live
+  `get_cat_vizier('ps1', ...)` call would apply, so the file is a drop-in
+  substitute for the live query's output.
+- **License**: MAST/STScI catalog data is public domain (US government-funded
+  survey data).

@@ -154,6 +154,27 @@ services:
       # STDWEB_PATH=../stdweb there. See skyportal_processor_service_ci.yaml.
       context: ${STDWEB_PATH:-../../stdweb}
     container_name: stdweb-web
+    environment:
+      # Unset by default (falls through to a live VizieR query, unchanged
+      # production behavior) -- CI sets this to point at a pre-fetched
+      # catalogue fixture so the integration test doesn't depend on a live,
+      # occasionally-flaky third-party service. See
+      # stdweb-ci/local_catalog.patch and tests/fixtures/README.md.
+      - STDWEB_LOCAL_CATALOG_FILE=${STDWEB_LOCAL_CATALOG_FILE:-}
+      # StdWeb's own POST /api/tasks/{id}/skyportal/ makes a direct PUT to
+      # SkyPortal using *this* token, not comment_watcher.py's -- see
+      # stdweb/settings.py's SKYPORTAL_TOKEN/SKYPORTAL_BASE_URL config()
+      # calls. "web" is this compose network's SkyPortal service name/port
+      # (container-to-container -- not the host-mapped localhost:9000 the
+      # test and comment_watcher.py use). Unset by default; SKYPORTAL_TOKEN
+      # isn't known until after SkyPortal's own init, so CI sets it by
+      # recreating this one container once the token exists -- see
+      # skyportal_processor_service_ci.yaml's "Configure StdWeb's SkyPortal
+      # token" step.
+      - SKYPORTAL_BASE_URL=http://web:5000
+      - SKYPORTAL_TOKEN=${SKYPORTAL_TOKEN:-}
+    volumes:
+      - ./tests/fixtures:/data/fixtures:ro
     ports:
       - "8000:8000"
     healthcheck:
