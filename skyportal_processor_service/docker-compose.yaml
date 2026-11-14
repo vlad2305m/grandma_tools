@@ -182,6 +182,15 @@ services:
       # known -- see skyportal_processor_service_ci.yaml's "Start StdWeb".
       - SKYPORTAL_BASE_URL=http://web:5000
       - SKYPORTAL_TOKEN=${SKYPORTAL_TOKEN:-}
+      # Which SkyPortal group the uploaded photometry point gets shared
+      # with -- see stdweb/stdweb/views_skyportal.py's
+      # skyportal_upload_photometry default. StdWeb's own default (group
+      # id 3, a specific demo group) is invisible to any other logged-in
+      # user; the public "Sitewide Group" (id 1 in the demo data, and
+      # every new user's default group as of SkyPortal's
+      # set_default_group_async) makes an uploaded point visible
+      # regardless of who's logged in.
+      - SKYPORTAL_GROUP_ID=1
     volumes:
       - ./tests/fixtures:/data/fixtures:ro
     ports:

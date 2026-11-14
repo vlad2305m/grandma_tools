@@ -315,7 +315,10 @@ def save_ledger(job: RescanJob) -> None:
     Analysis" UI feedback, not read back from here.
     """
     payload = {
-        "message": f"{len(job.processed_files)} processed, {len(job.failed_files)} failed (as of job #{job.job_id})",
+        "message": (
+            f"{len(job.processed_files)} processed, {len(job.failed_files)} failed (as of job #{job.job_id}). "
+            + "; ".join(describe_file_result(p, d.get("stdweb_id", -1), markdown=False) for p, d in job.file_details.items())
+        ),
         "show_parameters": False,
         "show_plots": False,
         "show_corner": False,
@@ -358,7 +361,10 @@ def send_webhook_callback(job: RescanJob) -> None:
     status = "success" if job.stage == 1000 else "failure"
     payload = {
         "status": status,
-        "message": f"{len(job.processed_files)} processed, {len(job.failed_files)} failed (as of job #{job.job_id})",
+        "message": (
+            f"{len(job.processed_files)} processed, {len(job.failed_files)} failed (as of job #{job.job_id}). "
+            + "; ".join(describe_file_result(p, d.get("stdweb_id", -1), markdown=False) for p, d in job.file_details.items())
+        ),
         "analysis": {
             "results": {
                 "format": "json",
@@ -486,6 +492,37 @@ def get_new_comments(
             dec=source["dec"],
         ))
     return new_jobs, last_iteration
+
+
+def owncloud_folder_url(relative_path: str) -> str:
+    """
+    Browsable OwnCloud Files-app link for a SAVE_PATH-relative folder (e.g.
+    "{source_id}/{telescope}") -- used by describe_file_result to enrich
+    progress/completion messages.
+    """
+    return f"{BASE_URL}/apps/files/?dir=/{SAVE_PATH}/{relative_path}"
+
+
+def describe_file_result(path: str, stdweb_id: int, markdown: bool) -> str:
+    """
+    One-line summary of a single file's outcome, as a link to its StdWeb
+    task page (most useful: shows the actual photometry/logs) if one was
+    ever created, else to its OwnCloud folder (e.g. it failed before
+    reaching StdWeb at all). markdown=True for comment_back's reply
+    (SkyPortal comments render markdown -- see package.json's
+    react-markdown); markdown=False for save_ledger/send_webhook_callback's
+    plain-text status message. Takes plain (path, stdweb_id) rather than a
+    FileJob so it works equally for this run's FileJob objects and for
+    job.file_details' cumulative, persisted entries (which cover files
+    processed/failed in *previous* runs too -- see save_ledger).
+    """
+    filename = path.split("/")[-1]
+    if stdweb_id and stdweb_id != -1:
+        url = f"{STDWEB_URL}/tasks/{stdweb_id}"
+    else:
+        folder = "/".join(path.split("/")[:-1])
+        url = owncloud_folder_url(folder)
+    return f"[{filename}]({url})" if markdown else f"{filename} ({url})"
 
 
 def comment_back(job: RescanJob, message: str) -> None:
@@ -783,6 +820,7 @@ def pipeline_tick(job: RescanJob) -> bool:
                             file_job.stage = 1001
                             file_job.error = status
                             job.failed_files.append(file_job.path)
+                            job.file_details[file_job.path] = {"stdweb_id": file_job.stdweb_id, "status": "failed", "error": file_job.error}
                             newly_failed.append(file_job)
                         elif status == "photometry_done":
                             file_job.stage = 7
@@ -813,9 +851,9 @@ def pipeline_tick(job: RescanJob) -> bool:
             if newly_done or newly_failed:
                 parts = []
                 if newly_done:
-                    parts.append(f"{len(newly_done)} done: {', '.join(f.path.split('/')[-1] for f in newly_done)}")
+                    parts.append(f"{len(newly_done)} done: " + ", ".join(describe_file_result(f.path, f.stdweb_id, markdown=True) for f in newly_done))
                 if newly_failed:
-                    parts.append(f"{len(newly_failed)} failed: {', '.join(f.path.split('/')[-1] for f in newly_failed)}")
+                    parts.append(f"{len(newly_failed)} failed: " + ", ".join(describe_file_result(f.path, f.stdweb_id, markdown=True) for f in newly_failed))
                 comment_back(job, "; ".join(parts) + ".")
                 save_ledger(job)
 
@@ -835,11 +873,12 @@ def pipeline_tick(job: RescanJob) -> bool:
     new_failed = sum(1 for f in job.file_jobs if f.stage == 1001)
     keywords_mentioned = any(k in job.comment.lower() for k in ("owncloud", "upload"))
     if new_done or new_failed or keywords_mentioned:
-        comment_back(
-            job,
+        summary = (
             f"Rescan complete: {new_done} new file(s) processed and uploaded to SkyPortal, {new_failed} new file(s) failed. "
-            f"Total: {len(job.processed_files)} processed, {len(job.failed_files)} failed.",
+            f"Total: {len(job.processed_files)} processed, {len(job.failed_files)} failed."
         )
+        details = "; ".join(describe_file_result(p, d.get("stdweb_id", -1), markdown=True) for p, d in job.file_details.items())
+        comment_back(job, f"{summary}\n{details}" if details else summary)
     return True
 
 def pipeline_tick_all() -> None:
