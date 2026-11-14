@@ -204,7 +204,14 @@ jobs:
           exit 1
         }
 
-        api_post /api/user '{"username": "ci-poster", "groupIDsAndAdmin": [[1, true]]}'
+        # groupIDsAndAdmin left empty: SkyPortal now auto-adds every new
+        # user to the configured public group (Sitewide Group, id 1 in the
+        # demo data) via set_default_group_async -- passing [[1, true]]
+        # explicitly here double-inserts the same (group_id, user_id) row
+        # and 400s. Admin on group 1 was never actually needed; plain
+        # membership is enough for ci-poster to post a comment on a group-1
+        # source.
+        api_post /api/user '{"username": "ci-poster", "groupIDsAndAdmin": []}'
         USER_ID=$(python3 -c "import json; print(json.load(open('/tmp/api_response.json'))['data']['id'])")
 
         api_post /api/internal/tokens "{\"user_id\": $USER_ID, \"acls\": [\"Comment\"], \"name\": \"ci-poster-token\"}"
