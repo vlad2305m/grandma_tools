@@ -68,11 +68,6 @@ jobs:
         cp skyportal_processor_service/stdweb-ci/docker-entrypoint.sh stdweb/docker-entrypoint.sh
         cp skyportal_processor_service/stdweb-ci/.dockerignore stdweb/.dockerignore
 
-        # Adds the STDWEB_LOCAL_CATALOG_FILE escape hatch -- see
-        # stdweb-ci/README.md for why.
-        cd stdweb
-        git apply ../skyportal_processor_service/stdweb-ci/local_catalog.patch
-
     - name: Patch SkyPortal docker.yaml for the externally-published port
       run: |
         # server.port is used only to build externally-facing URLs (e.g. the
@@ -137,7 +132,6 @@ jobs:
     - name: Start StdWeb
       env:
         STDWEB_PATH: ../stdweb
-        STDWEB_LOCAL_CATALOG_FILE: /data/fixtures/ps1_cat.parquet
         SKYPORTAL_TOKEN: ${{ steps.extract_skyportal_token.outputs.SKYPORTAL_TOKEN }}
       run: |
         # First start (not a restart): SKYPORTAL_TOKEN is already set, so

@@ -167,12 +167,6 @@ services:
       context: ${STDWEB_PATH:-../../stdweb}
     container_name: stdweb-web
     environment:
-      # Unset by default (falls through to a live VizieR query, unchanged
-      # production behavior) -- CI sets this to point at a pre-fetched
-      # catalogue fixture so the integration test doesn't depend on a live,
-      # occasionally-flaky third-party service. See
-      # stdweb-ci/local_catalog.patch and tests/fixtures/README.md.
-      - STDWEB_LOCAL_CATALOG_FILE=${STDWEB_LOCAL_CATALOG_FILE:-}
       # StdWeb's own POST /api/tasks/{id}/skyportal/ makes a direct PUT to
       # SkyPortal using *this* token, separate from comment_watcher.py's --
       # see stdweb/settings.py's SKYPORTAL_TOKEN/SKYPORTAL_BASE_URL. "web"
@@ -191,8 +185,6 @@ services:
       # set_default_group_async) makes an uploaded point visible
       # regardless of who's logged in.
       - SKYPORTAL_GROUP_ID=1
-    volumes:
-      - ./tests/fixtures:/data/fixtures:ro
     ports:
       - "8000:8000"
     healthcheck:
