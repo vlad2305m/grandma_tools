@@ -128,12 +128,12 @@ class RescanJob:
 pipeline: List[RescanJob] = []
 
 
-def _get_or_create_service(name: str, display_name: str, description: str, desired: dict) -> int:
+def _get_or_create_service(name: str, description: str, desired: dict) -> int:
     """
     Find the named Analysis Service, or create it if this is the first run
-    against this SkyPortal instance; update it if `desired` no longer
-    matches how it's currently configured there. Shared by
-    get_or_create_rescan_service and get_or_create_trigger_service.
+    against this SkyPortal instance; update it if `desired` (including
+    display_name) no longer matches how it's currently configured there.
+    Shared by get_or_create_rescan_service and get_or_create_trigger_service.
 
     Finding it only needs an ordinary token (GET is unrestricted); creating
     or updating it needs the "Manage Analysis Services" ACL, which
@@ -162,7 +162,6 @@ def _get_or_create_service(name: str, display_name: str, description: str, desir
 
     create_payload = {
         "name": name,
-        "display_name": display_name,
         "description": description,
         "authentication_type": "none",
         "analysis_type": "meta_analysis",
@@ -194,14 +193,21 @@ def get_or_create_rescan_service() -> int:
     """
     return _get_or_create_service(
         RESCAN_SERVICE_NAME,
-        "GRANDMA Rescan Ledger",
         (
             "Stores each source's processed/failed file ledger for the GRANDMA "
             "rescan pipeline (any comment on a source, or the separate "
-            '"GRANDMA Rescan (Run Analysis)" service if configured, triggers a '
-            "run that writes here). upload_only: not meant to be run directly."
+            '"Rescan OwnCloud" trigger service if configured, triggers a run '
+            "that writes here). upload_only: not meant to be run directly."
         ),
         desired={
+            # Same display_name as the trigger service (see
+            # get_or_create_trigger_service) -- distinguished internally by
+            # the unique `name` field (analysis_services.name has a DB
+            # unique constraint, display_name does not), not by what's shown
+            # in the UI. This one never appears on the "Run Analysis"
+            # dropdown (display_on_resource_dropdown: False), so the two
+            # sharing a label isn't ambiguous in practice.
+            "display_name": "Rescan OwnCloud",
             "upload_only": True,
             "url": f"{INSTANCE_URL}/not-a-real-analysis-endpoint",
             "display_on_resource_dropdown": False,
@@ -220,7 +226,6 @@ def get_or_create_trigger_service() -> int:
     """
     return _get_or_create_service(
         RESCAN_TRIGGER_SERVICE_NAME,
-        "GRANDMA Rescan (Run Analysis)",
         (
             "Rescans a source's OwnCloud folder for new FITS files, runs StdWeb "
             "forced photometry on each, and uploads the result to SkyPortal -- "
@@ -228,6 +233,7 @@ def get_or_create_trigger_service() -> int:
             '"Run Analysis" to trigger it directly, without posting a comment.'
         ),
         desired={
+            "display_name": "Rescan OwnCloud",
             "upload_only": False,
             "url": f"{WEBHOOK_URL}/trigger",
             "display_on_resource_dropdown": True,
