@@ -325,7 +325,11 @@ def save_ledger(job: RescanJob) -> None:
             f"{len(job.processed_files)} processed, {len(job.failed_files)} failed (as of job #{job.job_id}). "
             + "; ".join(describe_file_result(p, d.get("stdweb_id", -1), markdown=False) for p, d in job.file_details.items())
         ),
-        "show_parameters": False,
+        # True (despite the name): gates whether SkyPortal's frontend shows
+        # the "Analysis Results" accordion at all (see
+        # SourceAnalysisPage.tsx) -- without it, results.data below is
+        # uploaded but never rendered in the UI.
+        "show_parameters": True,
         "show_plots": False,
         "show_corner": False,
         "analysis": {
