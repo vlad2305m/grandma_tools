@@ -9,6 +9,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import traceback
 from typing import Dict, List, Optional, Set, Tuple
 import json
+import re
+from urllib.parse import urlparse
 
 import requests
 from config import get_required_env, load_env_file
@@ -27,10 +29,22 @@ header = {}
 seen_comments: Dict[str, Set[str]] = dict()  # Track seen comments (by source + created at) to avoid duplication
 # Memory-only, not persisted (restart re-derives everything from SkyPortal history anyway).
 
-# source_id -> (job_id, ra, dec) queued while a job for that source is already in `pipeline`;
-pending_rerun: Dict[str, Tuple[int, float, float]] = dict()
+# source_id -> (job_id, ra, dec, callback_url) queued while a job for that
+# source is already in `pipeline`; callback_url is "" for a comment-
+# triggered rerun (see get_new_comments/pipeline_tick_all).
+pending_rerun: Dict[str, Tuple[int, float, float, str]] = dict()
 
 jobformat_version = 0.2
+
+# Every outbound call below blocks the single-threaded main_loop (one poll
+# tick processes every job in `pipeline` sequentially) -- without an
+# explicit timeout, a stalled/unresponsive remote (including an
+# attacker-controlled webhook callback_url, see _is_valid_callback_url)
+# would hang this entire service indefinitely. File transfer (FITS bytes
+# between OwnCloud and StdWeb) gets a longer allowance than ordinary JSON
+# API calls.
+REQUEST_TIMEOUT = 30
+FILE_TRANSFER_TIMEOUT = 300
 
 # WebDAV PROPFIND depth used to list a source's whole directory tree in one request.
 # The real GRANDMA folder structure is source/telescope/[subfolder/]files (<=3 levels),
@@ -74,9 +88,13 @@ class FileJob:
     # Stages: 3=create task, 4=upload, 5=start, 6=poll, 7=upload photometry to SkyPortal, 1000=done, 1001=error
     stage: int = 3
     error: str = ""
+    # Consecutive transient (network/5xx) failures retried from this
+    # file's current checkpoint -- see pipeline_tick's MAX_FILE_RETRIES.
+    # Not incremented for a permanent failure (those go straight to 1001).
+    retry_count: int = 0
 
     def to_dict(self) -> dict:
-        return {"path": self.path, "stdweb_id": self.stdweb_id, "stage": self.stage, "error": self.error}
+        return {"path": self.path, "stdweb_id": self.stdweb_id, "stage": self.stage, "error": self.error, "retry_count": self.retry_count}
 
 
 @dataclass
@@ -108,6 +126,14 @@ class RescanJob:
     # processed_files/failed_files -- see save_ledger.
     file_details: Dict[str, dict] = field(default_factory=dict)
     version: float = jobformat_version
+    # FileJob objects (newly completed/failed, this run) not yet durably
+    # recorded via save_ledger -- see pipeline_tick's stage 3. Retried every
+    # tick until save_ledger actually succeeds, so a transient SkyPortal
+    # hiccup while saving can't silently lose a file's outcome and cause it
+    # to be reprocessed (duplicate StdWeb task, duplicate photometry
+    # upload) on a later rescan. Not part of serialize(): same FileJob
+    # objects already shown there via file_jobs.
+    unsaved_results: List[FileJob] = field(default_factory=list)
 
     # Dict is very inefficient, but back-compatible
     def serialize(self) -> str:
@@ -144,13 +170,14 @@ def _get_or_create_service(name: str, description: str, desired: dict) -> int:
     warn and keep using it as currently configured there -- this only matters
     if WEBHOOK_URL was just added or removed.
     """
-    response = requests.get(f"{INSTANCE_URL}/api/analysis_service", headers=header)
+    response = requests.get(f"{INSTANCE_URL}/api/analysis_service", headers=header, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
     for service in response.json()["data"]:
         if service["name"] == name:
             if any(service.get(k) != v for k, v in desired.items()):
                 patch = requests.patch(
-                    f"{INSTANCE_URL}/api/analysis_service/{service['id']}", headers=header, json=desired
+                    f"{INSTANCE_URL}/api/analysis_service/{service['id']}", headers=header, json=desired,
+                    timeout=REQUEST_TIMEOUT,
                 )
                 if patch.status_code != 200:
                     logger.warning(
@@ -171,7 +198,7 @@ def _get_or_create_service(name: str, description: str, desired: dict) -> int:
     }
     if SKYPORTAL_GROUP_IDS_FILTER:
         create_payload["group_ids"] = SKYPORTAL_GROUP_IDS_FILTER
-    response = requests.post(f"{INSTANCE_URL}/api/analysis_service", headers=header, json=create_payload)
+    response = requests.post(f"{INSTANCE_URL}/api/analysis_service", headers=header, json=create_payload, timeout=REQUEST_TIMEOUT)
     if response.status_code != 200:
         raise RuntimeError(
             f"Analysis service {name!r} doesn't exist yet and SKYPORTAL_TOKEN can't "
@@ -265,6 +292,7 @@ def restore_ledger(source_id: str) -> Tuple[List[str], List[str], Dict[str, dict
         f"{INSTANCE_URL}/api/obj/{source_id}/analysis",
         headers=header,
         params={"analysisServiceID": RESCAN_SERVICE_ID},
+        timeout=REQUEST_TIMEOUT,
     )
     response.raise_for_status()
     completed = [e for e in response.json()["data"] if e.get("status") == "completed"]
@@ -276,6 +304,7 @@ def restore_ledger(source_id: str) -> Tuple[List[str], List[str], Dict[str, dict
         f"{INSTANCE_URL}/api/obj/analysis/{latest_id}",
         headers=header,
         params={"includeAnalysisData": True},
+        timeout=REQUEST_TIMEOUT,
     )
     response.raise_for_status()
     data = response.json()["data"].get("data") or {}
@@ -302,11 +331,12 @@ def prune_ledger_entries(source_id: str, service_id: int) -> None:
         f"{INSTANCE_URL}/api/obj/{source_id}/analysis",
         headers=header,
         params={"analysisServiceID": service_id},
+        timeout=REQUEST_TIMEOUT,
     )
     response.raise_for_status()
     entries = sorted(response.json()["data"], key=lambda e: e["id"])
     for stale in entries[:-1]:
-        requests.delete(f"{INSTANCE_URL}/api/obj/analysis/{stale['id']}", headers=header).raise_for_status()
+        requests.delete(f"{INSTANCE_URL}/api/obj/analysis/{stale['id']}", headers=header, timeout=REQUEST_TIMEOUT).raise_for_status()
 
 
 def save_ledger(job: RescanJob) -> None:
@@ -349,6 +379,7 @@ def save_ledger(job: RescanJob) -> None:
         f"{INSTANCE_URL}/api/obj/{job.source_id}/analysis_upload/{RESCAN_SERVICE_ID}",
         headers=header,
         json=payload,
+        timeout=REQUEST_TIMEOUT,
     )
     response.raise_for_status()
     prune_ledger_entries(job.source_id, RESCAN_SERVICE_ID)
@@ -387,7 +418,11 @@ def send_webhook_callback(job: RescanJob) -> None:
         },
     }
     try:
-        response = requests.post(job.callback_url, json=payload)
+        # allow_redirects=False: job.callback_url already passed
+        # _is_valid_callback_url's origin+route check when the job was
+        # created, but a redirect response could still point the actual
+        # POST (the full ledger payload) at an arbitrary third party.
+        response = requests.post(job.callback_url, json=payload, timeout=REQUEST_TIMEOUT, allow_redirects=False)
         response.raise_for_status()
     except Exception:
         traceback.print_exc()
@@ -448,6 +483,7 @@ def get_new_comments(
             #"group_ids": SKYPORTAL_GROUP_IDS_FILTER,
         },
         headers=header,
+        timeout=REQUEST_TIMEOUT,
     )
     response.raise_for_status()
     logger.debug(f"Respose time: {response.elapsed.total_seconds() * 1000}ms")
@@ -492,7 +528,7 @@ def get_new_comments(
     for source_id, (comment, source) in latest_per_source.items():
         if source_id in active_sources:
             # Schedule a rescan after the current job finishes
-            pending_rerun[source_id] = (comment["id"], source["ra"], source["dec"])
+            pending_rerun[source_id] = (comment["id"], source["ra"], source["dec"], "")
             continue
         new_jobs.append(RescanJob(
             source_id=source_id,
@@ -549,6 +585,7 @@ def comment_back(job: RescanJob, message: str) -> None:
             #"group_ids": SKYPORTAL_GROUP_IDS_FILTER,
         },
         headers=header,
+        timeout=REQUEST_TIMEOUT,
     )
     response.raise_for_status()
 
@@ -559,7 +596,8 @@ def owncloud_exists(path: str) -> bool:
     """
     check_url = f"{BASE_URL}/remote.php/dav/files/{OWNCLOUD_USER_ID}/{SAVE_PATH}/{path}"
     response = requests.request(
-        "PROPFIND", check_url, auth=HTTPBasicAuth(OWNCLOUD_USERNAME, OWNCLOUD_TOKEN), headers={"Depth":"0"}
+        "PROPFIND", check_url, auth=HTTPBasicAuth(OWNCLOUD_USERNAME, OWNCLOUD_TOKEN), headers={"Depth":"0"},
+        timeout=REQUEST_TIMEOUT,
     )
     return response.status_code in [200, 207]
 
@@ -574,7 +612,8 @@ def owncloud_ls(path: str, depth: int = 1) -> Tuple[List[str], List[str]]:
     """
     check_url = f"{BASE_URL}/remote.php/dav/files/{OWNCLOUD_USER_ID}/{SAVE_PATH}/{path}"
     response = requests.request(
-        "PROPFIND", check_url, auth=HTTPBasicAuth(OWNCLOUD_USERNAME, OWNCLOUD_TOKEN), headers={"Depth":str(depth)}
+        "PROPFIND", check_url, auth=HTTPBasicAuth(OWNCLOUD_USERNAME, OWNCLOUD_TOKEN), headers={"Depth":str(depth)},
+        timeout=REQUEST_TIMEOUT,
     )
 
     if response.status_code != 207:
@@ -613,7 +652,8 @@ def stdweb_make_task(source_id: str, job_id: int, file_path: str, local_file: Op
     response = requests.request(
         "POST", f"{STDWEB_URL}/api/tasks/",
         headers={"Authorization": f"Token {STDWEB_TOKEN}"},
-        data=data
+        data=data,
+        timeout=REQUEST_TIMEOUT,
     )
     response.raise_for_status()
     return response.json()["id"]
@@ -631,7 +671,8 @@ def stdweb_start_task(stdweb_id: int, ra: float, dec: float) -> None:
             "config": {
                 "target": f"{ra:.15f},{dec:.15f}",
             }
-        }
+        },
+        timeout=REQUEST_TIMEOUT,
     )
     response.raise_for_status()
 
@@ -642,8 +683,9 @@ def stdweb_task_status(stdweb_id: int) -> str:
     Returns task status as string.
     """
     response = requests.request(
-        "GET", f"{STDWEB_URL}/api/tasks/{stdweb_id}/", 
-        headers={"Authorization": f"Token {STDWEB_TOKEN}"}
+        "GET", f"{STDWEB_URL}/api/tasks/{stdweb_id}/",
+        headers={"Authorization": f"Token {STDWEB_TOKEN}"},
+        timeout=REQUEST_TIMEOUT,
     )
     response.raise_for_status()
     return response.json()["state"]
@@ -660,6 +702,7 @@ def stdweb_upload_photometry(stdweb_id: int, source_id: str, instrument_name: st
         "POST", f"{STDWEB_URL}/api/tasks/{stdweb_id}/skyportal/",
         headers={"Authorization": f"Token {STDWEB_TOKEN}"},
         json={"source_id": source_id, "instrument_name": instrument_name, "ra": ra, "dec": dec},
+        timeout=REQUEST_TIMEOUT,
     )
     if not response.ok:
         try:
@@ -671,7 +714,8 @@ def stdweb_upload_photometry(stdweb_id: int, source_id: str, instrument_name: st
 def transfer_file_owncloud_to_stdweb(owncloud_path: str, stdweb_task_id: int, stdweb_filename: Optional[str] = None) -> None:
     download_url = f"{BASE_URL}/remote.php/dav/files/{OWNCLOUD_USER_ID}/{SAVE_PATH}/{owncloud_path}"
     response = requests.request(
-        "GET", download_url, auth=HTTPBasicAuth(OWNCLOUD_USERNAME, OWNCLOUD_TOKEN)
+        "GET", download_url, auth=HTTPBasicAuth(OWNCLOUD_USERNAME, OWNCLOUD_TOKEN),
+        timeout=FILE_TRANSFER_TIMEOUT,
     )
     response.raise_for_status()
     if stdweb_filename is None:
@@ -679,9 +723,29 @@ def transfer_file_owncloud_to_stdweb(owncloud_path: str, stdweb_task_id: int, st
     response2 = requests.request(
         "POST", f"{STDWEB_URL}/api/tasks/{stdweb_task_id}/files/{stdweb_filename}",
         headers={"Authorization": f"Token {STDWEB_TOKEN}"},
-        files={"file": (stdweb_filename, response.content, "application/fits")}
+        files={"file": (stdweb_filename, response.content, "application/fits")},
+        timeout=FILE_TRANSFER_TIMEOUT,
     )
     response2.raise_for_status()
+
+
+# File-level retries (see pipeline_tick's stage 3) for a network-level
+# hiccup -- StdWeb/SkyPortal momentarily unreachable, a timeout, a 5xx --
+# rather than a genuine failure (StdWeb reports "failed", a 4xx, an
+# unmapped telescope). failed_files is persisted via save_ledger and never
+# reconsidered by restore_ledger's stage-2 diff, so treating a transient
+# error the same as a permanent one would silently blacklist the file
+# forever; a persistently broken file still fails for good after this many
+# attempts.
+MAX_FILE_RETRIES = 5
+
+
+def _is_transient(e: Exception) -> bool:
+    if isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+        return True
+    if isinstance(e, requests.exceptions.HTTPError) and e.response is not None and e.response.status_code >= 500:
+        return True
+    return False
 
 
 def pipeline_tick(job: RescanJob) -> bool:
@@ -725,6 +789,7 @@ def pipeline_tick(job: RescanJob) -> bool:
                 response = requests.get(
                     f"{INSTANCE_URL}/api/sources/{job.source_id}/comments",
                     headers=header,
+                    timeout=REQUEST_TIMEOUT,
                 )
                 response.raise_for_status()
                 comments = response.json()["data"]
@@ -800,8 +865,6 @@ def pipeline_tick(job: RescanJob) -> bool:
                 comment_back(job, f"{len(pending)} new file(s) found ({len(known)} already processed). Creating tasks.")
 
         if job.stage == 3:
-            newly_done = []
-            newly_failed = []
             for file_job in job.file_jobs:
                 if file_job.stage >= 1000:
                     continue
@@ -831,7 +894,7 @@ def pipeline_tick(job: RescanJob) -> bool:
                             file_job.error = status
                             job.failed_files.append(file_job.path)
                             job.file_details[file_job.path] = {"stdweb_id": file_job.stdweb_id, "status": "failed", "error": file_job.error}
-                            newly_failed.append(file_job)
+                            job.unsaved_results.append(file_job)
                         elif status == "photometry_done":
                             file_job.stage = 7
                     if file_job.stage == 7:
@@ -846,28 +909,65 @@ def pipeline_tick(job: RescanJob) -> bool:
                         try:
                             stdweb_upload_photometry(file_job.stdweb_id, job.source_id, instrument_name, job.ra, job.dec)
                         except Exception as e:
+                            if _is_transient(e):
+                                # Re-raise unwrapped so the outer except below
+                                # can still recognize and retry it.
+                                raise
                             raise RuntimeError(f"SkyPortal upload failed: {e} ({task_link})")
                         file_job.stage = 1000
                         job.processed_files.append(file_job.path)
                         job.file_details[file_job.path] = {"stdweb_id": file_job.stdweb_id, "status": "processed"}
-                        newly_done.append(file_job)
+                        job.unsaved_results.append(file_job)
                 except Exception as e:
+                    if _is_transient(e) and file_job.retry_count < MAX_FILE_RETRIES:
+                        # file_job.stage is left untouched, so the next tick
+                        # resumes the same call rather than permanently
+                        # blacklisting the file -- see MAX_FILE_RETRIES.
+                        file_job.retry_count += 1
+                        logger.warning(
+                            f"Transient error on {file_job.path} (attempt {file_job.retry_count}/{MAX_FILE_RETRIES}), "
+                            f"retrying next tick: {e}"
+                        )
+                        continue
                     file_job.stage = 1001
                     file_job.error = str(e)
                     job.failed_files.append(file_job.path)
                     job.file_details[file_job.path] = {"stdweb_id": file_job.stdweb_id, "status": "failed", "error": file_job.error}
-                    newly_failed.append(file_job)
+                    job.unsaved_results.append(file_job)
 
-            if newly_done or newly_failed:
-                parts = []
-                if newly_done:
-                    parts.append(f"{len(newly_done)} done: " + ", ".join(describe_file_result(f.path, f.stdweb_id, markdown=True) for f in newly_done))
-                if newly_failed:
-                    parts.append(f"{len(newly_failed)} failed: " + ", ".join(describe_file_result(f.path, f.stdweb_id, markdown=True) for f in newly_failed))
-                comment_back(job, "; ".join(parts) + ".")
-                save_ledger(job)
+            if job.unsaved_results:
+                newly_done = [f for f in job.unsaved_results if f.stage == 1000]
+                newly_failed = [f for f in job.unsaved_results if f.stage == 1001]
+                try:
+                    # Save before notifying, and independently of whether the
+                    # notification succeeds: a processed/failed file must be
+                    # durably recorded in the ledger even if the progress
+                    # comment fails to post, or a future restore_ledger would
+                    # never learn about it and silently reprocess it
+                    # (duplicate StdWeb task, duplicate SkyPortal photometry
+                    # upload) on the next rescan. Retried every tick
+                    # (job.unsaved_results stays populated) until it succeeds.
+                    save_ledger(job)
+                except Exception:
+                    traceback.print_exc()
+                    logger.error(f"Could not save ledger for job #{job.job_id} ({job.source_id}); will retry next tick")
+                else:
+                    job.unsaved_results = []
+                    parts = []
+                    if newly_done:
+                        parts.append(f"{len(newly_done)} done: " + ", ".join(describe_file_result(f.path, f.stdweb_id, markdown=True) for f in newly_done))
+                    if newly_failed:
+                        parts.append(f"{len(newly_failed)} failed: " + ", ".join(describe_file_result(f.path, f.stdweb_id, markdown=True) for f in newly_failed))
+                    try:
+                        comment_back(job, "; ".join(parts) + ".")
+                    except Exception:
+                        # Best-effort only -- the ledger save above already
+                        # succeeded, so no state is lost if this particular
+                        # notification comment doesn't make it.
+                        traceback.print_exc()
+                        logger.error(f"Could not post progress comment for job #{job.job_id} ({job.source_id})")
 
-            if all(file_job.stage >= 1000 for file_job in job.file_jobs):
+            if all(file_job.stage >= 1000 for file_job in job.file_jobs) and not job.unsaved_results:
                 job.stage = 1000
             else:
                 return False
@@ -894,11 +994,11 @@ def pipeline_tick(job: RescanJob) -> bool:
 def pipeline_tick_all() -> None:
     """
     Run all tasks in the pipeline and remove the ones that have finished. When a
-    job finishes, if another comment arrived for its source while it was running
-    (queued in pending_rerun by get_new_comments), start that rerun immediately
-    rather than waiting for the next poll. A finished webhook-triggered job
-    (job.callback_url set) also reports its result back to SkyPortal -- see
-    send_webhook_callback.
+    job finishes, if another comment or webhook trigger arrived for its source
+    while it was running (queued in pending_rerun by get_new_comments or
+    main_loop's trigger_queue drain), start that rerun immediately rather than
+    waiting for the next poll. A finished webhook-triggered job (job.callback_url
+    set) also reports its result back to SkyPortal -- see send_webhook_callback.
     """
     i = 0
     while i < len(pipeline):
@@ -909,10 +1009,37 @@ def pipeline_tick_all() -> None:
             pipeline.pop(i)
             queued = pending_rerun.pop(job.source_id, None)
             if queued is not None:
-                job_id, ra, dec = queued
-                pipeline.append(RescanJob(source_id=job.source_id, job_id=job_id, stage=1, ra=ra, dec=dec))
+                job_id, ra, dec, callback_url = queued
+                pipeline.append(RescanJob(source_id=job.source_id, job_id=job_id, stage=1, ra=ra, dec=dec, callback_url=callback_url))
         else:
             i += 1
+
+# SkyPortal's own callback_url format (see
+# https://skyportal.io/docs/analysis.html and skyportal/utils/app.py's
+# get_app_base_url/handled_by_url): {app_base_url}/api/webhook/obj_analysis/{token}.
+_CALLBACK_PATH_RE = re.compile(r"^/api/webhook/obj_analysis/[^/]+$")
+
+
+def _is_valid_callback_url(url: str) -> bool:
+    """
+    WebhookHandler.do_POST's request body supplies both resource_id and
+    callback_url verbatim -- without this check, anyone who can reach
+    WEBHOOK_LISTEN_HOST:WEBHOOK_LISTEN_PORT (0.0.0.0 by default) could name
+    any real source_id with their own callback_url; pipeline_tick would then
+    read that source's full ledger (file paths, StdWeb task ids, error
+    text) using this service's own SkyPortal credentials and
+    send_webhook_callback would hand all of it to the attacker's server.
+    Restrict callback_url to exactly INSTANCE_URL's own origin and
+    SkyPortal's documented callback route.
+    """
+    expected = urlparse(INSTANCE_URL)
+    parsed = urlparse(url)
+    return (
+        parsed.scheme == expected.scheme
+        and parsed.netloc == expected.netloc
+        and bool(_CALLBACK_PATH_RE.match(parsed.path))
+    )
+
 
 class WebhookHandler(BaseHTTPRequestHandler):
     """
@@ -920,12 +1047,18 @@ class WebhookHandler(BaseHTTPRequestHandler):
     (see get_or_create_trigger_service/run_webhook_server) and turns it into a
     RescanJob on trigger_queue, same as a comment does for get_new_comments.
     Runs on its own thread -- see run_webhook_server -- so it never touches
-    `pipeline` directly (that's main_loop's job, draining trigger_queue).
+    `pipeline` directly (that's main_loop's job, draining trigger_queue and
+    applying the same already-running-source guard as comments; see
+    main_loop).
 
-    SkyPortal expects an immediate 200 acknowledging receipt (it records
-    anything else as a failed run); the actual rescan happens later,
-    asynchronously, same as any other job in the pipeline. See
-    send_webhook_callback for how/when the result is reported back.
+    do_POST rejects (400) a request whose callback_url doesn't pass
+    _is_valid_callback_url -- without that check this endpoint would let
+    anyone who can reach it read any source's ledger via a callback_url of
+    their choosing. Otherwise it expects an immediate 200 acknowledging
+    receipt (SkyPortal records anything else as a failed run); the actual
+    rescan happens later, asynchronously, same as any other job in the
+    pipeline. See send_webhook_callback for how/when the result is reported
+    back.
     """
 
     def log_message(self, format, *args):
@@ -938,7 +1071,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             source_id = body.get("resource_id")
             callback_url = body.get("callback_url")
             obj = (body.get("inputs") or {}).get("obj") or {}
-            if not source_id or not callback_url:
+            if not source_id or not callback_url or not _is_valid_callback_url(callback_url):
                 self.send_response(400)
                 self.end_headers()
                 return
@@ -998,6 +1131,18 @@ def main_loop(start_time: datetime) -> None:
 
             while not trigger_queue.empty():
                 job = trigger_queue.get_nowait()
+                active_sources = {j.source_id for j in pipeline}
+                if job.source_id in active_sources:
+                    # Same coalescing guard as comment-triggered jobs (see
+                    # get_new_comments) -- without it, a second "Run Analysis"
+                    # click (or a retried webhook delivery) for a source
+                    # already mid-rescan starts a fully independent second
+                    # job: duplicate StdWeb tasks, duplicate SkyPortal
+                    # photometry uploads, and a last-writer-wins race on
+                    # save_ledger.
+                    pending_rerun[job.source_id] = (job.job_id, job.ra, job.dec, job.callback_url)
+                    logger.info(f"Webhook trigger for {job.source_id} deferred -- already running")
+                    continue
                 logger.info(f"New webhook trigger for {job.source_id}")
                 pipeline.append(job)
 
@@ -1101,7 +1246,7 @@ if __name__ == "__main__":
     # own; only automated replies posted under this same identity are
     # excluded. Resolved once at startup rather than hardcoded so
     # SKYPORTAL_TOKEN alone determines identity.
-    response = requests.get(f"{INSTANCE_URL}/api/internal/profile", headers=header)
+    response = requests.get(f"{INSTANCE_URL}/api/internal/profile", headers=header, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
     SELF_USER_ID = response.json()["data"]["id"]
 
