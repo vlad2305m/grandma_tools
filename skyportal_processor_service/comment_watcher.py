@@ -321,11 +321,14 @@ def prune_ledger_entries(source_id: str, service_id: int) -> None:
     """
     Delete every ObjAnalysis entry for this source against `service_id`
     except the newest (by id) -- keeps at most one at all times, well under
-    SkyPortal's analysis_services.max_analysis_per_obj_per_user cap. Called
-    after every completion against both RESCAN_SERVICE_ID (see save_ledger)
-    and RESCAN_TRIGGER_SERVICE_ID (see send_webhook_callback) separately.
-    Safe without locking/transactions: only one instance of this service runs
-    at a time.
+    SkyPortal's analysis_services.max_analysis_per_obj_per_user cap. Only
+    ever called against RESCAN_SERVICE_ID (see save_ledger): correct there
+    because save_ledger's same-source guard means at most one run -- and so
+    at most one *live* entry -- ever exists for a source at a time. NOT
+    safe for RESCAN_TRIGGER_SERVICE_ID, where several entries can be
+    genuinely live at once (one running, one freshly queued in
+    pending_rerun, one just superseded) -- see prune_stale_trigger_entries
+    for that service instead.
     """
     response = requests.get(
         f"{INSTANCE_URL}/api/obj/{source_id}/analysis",
@@ -336,6 +339,38 @@ def prune_ledger_entries(source_id: str, service_id: int) -> None:
     response.raise_for_status()
     entries = sorted(response.json()["data"], key=lambda e: e["id"])
     for stale in entries[:-1]:
+        requests.delete(f"{INSTANCE_URL}/api/obj/analysis/{stale['id']}", headers=header, timeout=REQUEST_TIMEOUT).raise_for_status()
+
+
+def prune_stale_trigger_entries(source_id: str) -> None:
+    """
+    Delete terminal (not "queued"/"pending") ObjAnalysis entries for this
+    source against RESCAN_TRIGGER_SERVICE_ID, keeping only the single
+    newest terminal one -- cleans up old "Run Analysis" results from the
+    UI without ever touching an entry that's still in flight.
+
+    Unlike RESCAN_SERVICE_ID (prune_ledger_entries, safe to reduce to "keep
+    only the newest" because save_ledger's same-source guard means at most
+    one run is ever live at a time), two or three RESCAN_TRIGGER_SERVICE_ID
+    entries can be genuinely live at once now: one running, one freshly
+    deferred into pending_rerun, one just superseded -- see
+    _schedule_pending_rerun. Blindly keeping only the newest id would
+    delete an in-flight sibling's row out from under it, so its own
+    eventual callback would 403 with "Invalid token" (confirmed: this is
+    exactly what the old shared prune_ledger_entries call used to do here).
+    """
+    response = requests.get(
+        f"{INSTANCE_URL}/api/obj/{source_id}/analysis",
+        headers=header,
+        params={"analysisServiceID": RESCAN_TRIGGER_SERVICE_ID},
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    terminal = sorted(
+        (e for e in response.json()["data"] if e.get("status") not in ("queued", "pending")),
+        key=lambda e: e["id"],
+    )
+    for stale in terminal[:-1]:
         requests.delete(f"{INSTANCE_URL}/api/obj/analysis/{stale['id']}", headers=header, timeout=REQUEST_TIMEOUT).raise_for_status()
 
 
@@ -428,7 +463,55 @@ def send_webhook_callback(job: RescanJob) -> None:
         traceback.print_exc()
         logger.error(f"Could not deliver webhook callback for job #{job.job_id} ({job.source_id})")
         return
-    prune_ledger_entries(job.source_id, RESCAN_TRIGGER_SERVICE_ID)
+    prune_stale_trigger_entries(job.source_id)
+
+
+def notify_superseded(source_id: str, job_id: int, callback_url: str) -> None:
+    """
+    Tell SkyPortal that a webhook-triggered "Run Analysis" job was replaced
+    by a newer trigger for the same source before it ever got to run -- see
+    _schedule_pending_rerun's overwrite points in get_new_comments and
+    main_loop. Without this, the superseded entry's ObjAnalysis record sits
+    in "queued" forever: SkyPortal only transitions it when this token's
+    callback_url is POSTed to, so the UI would otherwise show it stuck
+    "running" until the analysis service's own 7200s timeout eventually
+    marks it failed with no explanation (see _get_or_create_service's
+    create_payload). There's no "superseded"/"cancelled" status in
+    SkyPortal's webhook contract, only "success" or "failure" (see
+    skyportal/handlers/api/webhook.py) -- "failure" is the honest one here,
+    distinct from a genuine completed run.
+    """
+    payload = {
+        "status": "failure",
+        "message": (
+            f"Superseded by a newer rescan trigger for this source before "
+            f"job #{job_id} could run -- see the latest run's results instead."
+        ),
+    }
+    try:
+        response = requests.post(callback_url, json=payload, timeout=REQUEST_TIMEOUT, allow_redirects=False)
+        response.raise_for_status()
+    except Exception:
+        traceback.print_exc()
+        logger.error(f"Could not deliver 'superseded' webhook callback for job #{job_id} ({source_id})")
+        return
+    prune_stale_trigger_entries(source_id)
+
+
+def _schedule_pending_rerun(source_id: str, job_id: int, ra: float, dec: float, callback_url: str) -> None:
+    """
+    Set pending_rerun[source_id], first notifying (as superseded, see
+    notify_superseded) whatever webhook trigger it's about to silently
+    replace -- pending_rerun holds at most one entry per source, so an
+    overwrite would otherwise just drop the old callback_url on the floor.
+    Shared by get_new_comments (a comment coalescing over an existing
+    pending entry) and main_loop's trigger_queue drain (a second "Run
+    Analysis" trigger for a source already mid-rescan).
+    """
+    existing = pending_rerun.get(source_id)
+    if existing is not None and existing[3]:
+        notify_superseded(source_id, existing[0], existing[3])
+    pending_rerun[source_id] = (job_id, ra, dec, callback_url)
 
 
 def get_new_comments(
@@ -528,7 +611,7 @@ def get_new_comments(
     for source_id, (comment, source) in latest_per_source.items():
         if source_id in active_sources:
             # Schedule a rescan after the current job finishes
-            pending_rerun[source_id] = (comment["id"], source["ra"], source["dec"], "")
+            _schedule_pending_rerun(source_id, comment["id"], source["ra"], source["dec"], "")
             continue
         new_jobs.append(RescanJob(
             source_id=source_id,
@@ -1139,8 +1222,11 @@ def main_loop(start_time: datetime) -> None:
                     # already mid-rescan starts a fully independent second
                     # job: duplicate StdWeb tasks, duplicate SkyPortal
                     # photometry uploads, and a last-writer-wins race on
-                    # save_ledger.
-                    pending_rerun[job.source_id] = (job.job_id, job.ra, job.dec, job.callback_url)
+                    # save_ledger. _schedule_pending_rerun also notifies
+                    # (as superseded) whatever earlier pending trigger this
+                    # one replaces, so it doesn't sit "queued" forever in
+                    # SkyPortal's UI.
+                    _schedule_pending_rerun(job.source_id, job.job_id, job.ra, job.dec, job.callback_url)
                     logger.info(f"Webhook trigger for {job.source_id} deferred -- already running")
                     continue
                 logger.info(f"New webhook trigger for {job.source_id}")
