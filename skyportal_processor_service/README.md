@@ -11,7 +11,9 @@ the result back to the SkyPortal source as a photometry point.
   self-reply filter, not a blanket bot/non-bot one -- a different bot
   account's comment still counts, see `get_new_comments`) and an explicit
   `@rescanhelp`/`@rescandump` command, which reply directly instead of
-  triggering a check (see below).
+  triggering a check (see below). Set `REQUIRE_COMMAND=true` to restrict
+  this further: only a comment that contains `SKYPORTAL_COMMAND` (e.g.
+  `@rescan`) anywhere triggers a check; anything else is ignored outright.
 * Also runnable directly from SkyPortal's own "Run Analysis" UI/API, without
   posting a comment -- see "Triggering a rescan" below.
 * Recursively scans the source's OwnCloud folder for new FITS files, checking

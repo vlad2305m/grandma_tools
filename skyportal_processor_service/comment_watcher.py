@@ -454,6 +454,34 @@ def _schedule_pending_rerun(source_id: str, job_id: int, ra: float, dec: float, 
     pending_rerun[source_id] = (job_id, ra, dec, callback_url)
 
 
+# Resolved lazily per user id, cached forever (usernames don't change) --
+# see get_username.
+_username_cache: Dict[int, str] = {}
+
+
+def get_username(user_id: int) -> str:
+    """
+    Resolve a SkyPortal user id to its username, for comment_back's
+    "@{job.author}" mention -- that only resolves to a real notification
+    if it matches an actual username (see mentioned_usernames in
+    skyportal/utils/parse.py), and get_new_comments's bulk
+    GET /api/sources?includeComments=true only carries author_id, not the
+    full nested author object the per-source GET /api/sources/{id}/comments
+    returns. Returns "" (no mention, rather than failing the whole poll)
+    if the lookup itself fails.
+    """
+    if user_id not in _username_cache:
+        try:
+            response = requests.get(f"{INSTANCE_URL}/api/user/{user_id}", headers=header, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            _username_cache[user_id] = response.json()["data"]["username"]
+        except Exception:
+            traceback.print_exc()
+            logger.warning(f"Could not resolve username for user id {user_id}; reply will have no @mention")
+            return ""
+    return _username_cache[user_id]
+
+
 def _handle_comment(source: dict, comment: dict) -> None:
     """
     Parse one new comment (already filtered by get_new_comments: not a
@@ -462,10 +490,13 @@ def _handle_comment(source: dict, comment: dict) -> None:
     A comment containing SKYPORTAL_COMMAND immediately followed by a
     non-space suffix is an explicit operator command (help/dump/
     unrecognized) -- handled synchronously right here with a direct reply,
-    no rescan job needed. Everything else (bare "@rescan", or "@rescan"
-    embedded in other text) schedules a real rescan job: appended straight
-    to `pipeline`, or deferred to pending_rerun if a job for this source is
-    already active (see _schedule_pending_rerun).
+    no rescan job needed. Everything else is ignored outright if
+    REQUIRE_COMMAND is set and the comment doesn't contain SKYPORTAL_COMMAND
+    at all; otherwise (the default) it schedules a real rescan job: bare
+    "@rescan", "@rescan" embedded in other text, or any comment whatsoever
+    if REQUIRE_COMMAND is unset -- appended straight to `pipeline`, or
+    deferred to pending_rerun if a job for this source is already active
+    (see _schedule_pending_rerun).
 
     Mutates `pipeline`/`pending_rerun` directly rather than returning
     something for the caller to schedule, so get_new_comments doesn't need
@@ -476,11 +507,14 @@ def _handle_comment(source: dict, comment: dict) -> None:
     a pending rerun -- benign, the pending one just waits its turn, same as
     any other pending_rerun.
     """
-    author = comment["author_id"]
-    command_suffix = comment["text"].split(SKYPORTAL_COMMAND)[1] if SKYPORTAL_COMMAND in comment["text"] else ""
+    has_command = SKYPORTAL_COMMAND in comment["text"]
+    if REQUIRE_COMMAND and not has_command:
+        return
+    author = get_username(comment["author_id"])
+    command_suffix = comment["text"].split(SKYPORTAL_COMMAND)[1] if has_command else ""
     argv = command_suffix.split(" ")
     if argv[0]:
-        help_message = f"Usage: any comment triggers a rescan of this source's OwnCloud directory. Feedback is silent unless new files are found (or fail), or your comment mentions 'owncloud'/'upload'.\nExplicit commands (no space before the keyword):\n{SKYPORTAL_COMMAND}help\n{SKYPORTAL_COMMAND}dump [limit]."
+        help_message = f"Usage: any comment triggers a rescan of this source's OwnCloud directory. Feedback is silent unless new files are found (or fail), or your comment explicitly contains '{SKYPORTAL_COMMAND}'.\nExplicit commands (no space before the keyword):\n{SKYPORTAL_COMMAND}help\n{SKYPORTAL_COMMAND}dump [limit]."
         reply_job = RescanJob(source_id=source["id"], author=author)
         if argv[0] == "help":
             comment_back(reply_job, help_message)
@@ -778,10 +812,12 @@ def pipeline_tick(job: RescanJob) -> bool:
     job pipeline_tick actually sees is a genuine rescan (comment- or
     webhook-triggered). The flow below -- restoring the files, listing
     OwnCloud, creating tasks -- is silent unless it finds something worth
-    reporting: new files, a failure, or the triggering comment itself
-    mentions "owncloud"/"upload" (in which case a "nothing new" reply is
-    sent too, so a human who says they uploaded something gets
-    confirmation either way).
+    reporting: new files processed, a failure, or the triggering comment
+    itself explicitly contains SKYPORTAL_COMMAND (e.g. "@rescan") -- so a
+    human who deliberately asked for a rescan always gets confirmation,
+    even when there was nothing new to do, while an incidental comment
+    that happens to trigger one too (any comment does) stays silent
+    unless something actually happened.
 
     Flow (labelled by job.stage):
     1. Restore the processed/failed file ledger (see restore_ledger -- a
@@ -943,8 +979,8 @@ def pipeline_tick(job: RescanJob) -> bool:
     else:
         new_done = sum(1 for f in job.file_jobs if f.stage == 1000)
         new_failed = sum(1 for f in job.file_jobs if f.stage == 1001)
-        keywords_mentioned = any(k in job.comment.lower() for k in ("owncloud", "upload"))
-        if new_done or new_failed or keywords_mentioned:
+        rescan_mentioned = SKYPORTAL_COMMAND in job.comment
+        if new_done or new_failed or rescan_mentioned:
             summary = (
                 f"Rescan complete: {new_done} new file(s) processed and uploaded to SkyPortal, {new_failed} new file(s) failed. "
                 f"Total: {len(job.processed_files)} processed, {len(job.failed_files)} failed."
@@ -1223,6 +1259,11 @@ if __name__ == "__main__":
             int(x.strip()) for x in os.getenv("GROUP_IDS", "").split(",") if x.strip()
         ]
         SKYPORTAL_COMMAND=os.getenv("SKYPORTAL_COMMAND", "@rescan")
+        # If true, only comments containing SKYPORTAL_COMMAND trigger a
+        # rescan -- any other comment is ignored outright (not even
+        # silently scheduled). Default (false): any comment triggers a
+        # check, see _handle_comment.
+        REQUIRE_COMMAND = os.getenv("REQUIRE_COMMAND", "false").strip().lower() == "true"
         # Externally-reachable base URL for this process's own HTTP listener
         # (e.g. "http://100.90.108.127:8765"), so SkyPortal's "Run Analysis"
         # button can trigger a rescan directly, not just via a comment -- see

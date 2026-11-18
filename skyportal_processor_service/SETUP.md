@@ -86,9 +86,9 @@ different from the instrument name in SkyPortal.
 
 1. Start the service (`python comment_watcher.py --env-file .env`) and
    confirm it logs `Listening for new sources...` without errors --
-   startup itself only touches SkyPortal, exercising step 1 (token
-   validity, `Manage Analysis Services` or a working manually-created
-   `grandma_rescan` service). OwnCloud and StdWeb auth aren't exercised
+   startup only touches SkyPortal, testing step 1 (token validity,
+   `Manage Analysis Services` or a working manually-created
+   `grandma_rescan` service). OwnCloud and StdWeb auth aren't tested
    until the next step, when a real file actually gets scanned.
 2. Post a plain (non-command) comment on a real source that has a file
    under a mapped telescope folder in OwnCloud. Within `POLL_INTERVAL`
@@ -103,5 +103,5 @@ different from the instrument name in SkyPortal.
    ACL and the Analysis Service registration together.
 5. If `STDWEB_GROUP_ID` is set, log into StdWeb as a real operator account
    (a member of that group, not the bot) and open the StdWeb task link
-   from the reply comment in step 2 -- it should load, not 403. An
-   account that is *not* a member of that group should still get a 403.
+   from the reply comment in step 2. An account that is *not* a member 
+   of that group should get a 403.
