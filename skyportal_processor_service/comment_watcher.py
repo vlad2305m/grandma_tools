@@ -16,7 +16,20 @@ import requests
 from config import get_required_env, load_env_file
 from requests.auth import HTTPBasicAuth
 import logging
-logging.getLogger().setLevel(logging.DEBUG)
+
+# A dedicated logger -- not `logging` the module itself (that was the old
+# `logger = logging` assignment in __main__: works by accident, since the
+# module exposes same-named forwarding functions, but isn't a real Logger).
+# Third-party libraries (requests, urllib3) are deliberately left at
+# logging's default WARNING level: only this service's own messages follow
+# LOG_LEVEL (applied once the configured .env is loaded -- see `__main__`)
+# -- the old `logging.getLogger().setLevel(logging.DEBUG)` set the *root*
+# logger unconditionally at import time, which also forced every
+# third-party DEBUG message (e.g. one urllib3 line per HTTP request) on
+# any importer, with no way to opt out.
+logging.basicConfig(level=logging.WARNING, format="%(levelname)s:%(name)s:%(message)s")
+logger = logging.getLogger("comment_watcher")
+logger.setLevel(logging.INFO)
 
 # TODO
 # verify radec of Skyportal source is the one we need
@@ -1269,11 +1282,17 @@ if __name__ == "__main__":
     args = parse_args()
     load_env_file(args.env_file)
 
-    # Setup logger
-    # slack_token = os.getenv("SLACK_BOT_TOKEN")
-    # service_name = os.getenv("SLACK_SERVICE_NAME", "owncloud-folder-service")
-    # channel = "#" + service_name
-    logger = logging #setup_logger(service_name, slack_token, channel)
+    # LOG_LEVEL is read only now, not at import time, so it can come from
+    # --env-file as well as an already-exported shell variable; only this
+    # service's own logger is affected (see the module-level
+    # logging.basicConfig/logger setup above) -- third-party libraries
+    # (requests, urllib3) stay at the default WARNING level regardless.
+    log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    log_level = getattr(logging, log_level_name, None)
+    if not isinstance(log_level, int):
+        logger.warning(f"Invalid LOG_LEVEL {log_level_name!r}, falling back to INFO")
+        log_level = logging.INFO
+    logger.setLevel(log_level)
 
     try:
         BASE_URL = os.getenv(
