@@ -1078,7 +1078,14 @@ class WebhookHandler(BaseHTTPRequestHandler):
     (SkyPortal records anything else as a failed run); the actual rescan
     happens later, asynchronously, same as any other job in the pipeline.
     See pipeline_tick for how/when the result is reported back.
+
+    `timeout` (below) bounds the underlying socket, so a slow/stalled
+    client holding the connection open (deliberately or not) can't tie up
+    a thread indefinitely -- same reasoning as REQUEST_TIMEOUT on every
+    outgoing call in this file, just for the one incoming one.
     """
+
+    timeout = REQUEST_TIMEOUT
 
     def log_message(self, format, *args):
         pass  # comment_watcher.py already logs; skip BaseHTTPRequestHandler's default access log

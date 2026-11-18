@@ -89,8 +89,8 @@ different from the instrument name in SkyPortal.
    startup only touches SkyPortal, testing step 1 (token validity,
    `Manage Analysis Services` or a working manually-created
    `grandma_rescan` service). OwnCloud and StdWeb auth aren't tested
-   until the next step, when a real file actually gets scanned.
-2. Post a plain (non-command) comment on a real source that has a file
+   until the next step, when a file actually gets scanned.
+2. Post a `@rescan` comment on a source that has a file
    under a mapped telescope folder in OwnCloud. Within `POLL_INTERVAL`
    seconds, the service should pick it up, and within the StdWeb
    processing time, reply on the thread with `N new file(s) processed and
@@ -101,7 +101,7 @@ different from the instrument name in SkyPortal.
 4. Check the source's ledger (`GET /api/obj/{id}/analysis?analysisServiceID=<grandma_rescan id>`)
    shows the file as `processed` -- this exercises step 1's `Run Analyses`
    ACL and the Analysis Service registration together.
-5. If `STDWEB_GROUP_ID` is set, log into StdWeb as a real operator account
+5. If `STDWEB_GROUP_ID` is set, log into StdWeb as an operator account
    (a member of that group, not the bot) and open the StdWeb task link
    from the reply comment in step 2. An account that is *not* a member 
    of that group should get a 403.
