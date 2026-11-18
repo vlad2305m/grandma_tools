@@ -740,11 +740,24 @@ def stdweb_make_task(source_id: str, job_id: int, file_path: str, local_file: Op
     Otherwise the caller must still populate the task via
     transfer_file_owncloud_to_stdweb.
 
+    Shared with STDWEB_GROUP_ID (a StdWeb Django Group *name*, not a
+    numeric id -- StdWeb's own task-sharing field is name-keyed
+    (api/serializers.py's TaskSerializer.groups is a SlugRelatedField on
+    'name'), and StdWeb exposes no API to resolve a numeric group id to
+    one) if configured, so a real operator with that StdWeb group can
+    actually view the task via the link posted in rescan replies (see
+    describe_file_result) -- without this, every task is owned solely by
+    STDWEB_TOKEN's bot account and Task.can_view() denies everyone else
+    (confirmed: StdWeb staff/view_all_tasks holders are the only
+    exception). Unset by default: tasks stay bot-only, exactly as before.
+
     Returns task id of the new task.
     """
     data = {"original_name": f"{source_id}/{file_path.split('/')[-1]} : {job_id}"}
     if local_file:
         data["local_file"] = local_file
+    if STDWEB_GROUP_ID:
+        data["groups"] = [STDWEB_GROUP_ID]
     response = requests.request(
         "POST", f"{STDWEB_URL}/api/tasks/",
         headers={"Authorization": f"Token {STDWEB_TOKEN}"},
@@ -1317,6 +1330,11 @@ if __name__ == "__main__":
         # under StdWeb's DATA_PATH (see stdweb_make_task's local_file docs) -- setting
         # it prematurely points StdWeb at a path that doesn't exist there yet.
         STDWEB_SAVE_PATH = os.getenv("STDWEB_SAVE_PATH", "")
+        # StdWeb Django Group *name* (see stdweb_make_task) tasks get shared
+        # with -- unset by default, meaning every created task stays visible
+        # only to STDWEB_TOKEN's own bot account (and StdWeb staff/
+        # view_all_tasks holders), exactly as before this setting existed.
+        STDWEB_GROUP_ID = os.getenv("STDWEB_GROUP_ID", "")
         SOURCE_TAG = os.getenv("SOURCE_TAG", "")
         POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
         SKYPORTAL_GROUP_IDS_FILTER = [

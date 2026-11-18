@@ -87,11 +87,19 @@ user = get_user_model().objects.get(username="grandma-rescan")
 user.user_permissions.add(Permission.objects.get(codename="skyportal_upload"))
 ```
 
-No other StdWeb permission is needed: this service only ever creates,
-uploads to, and reads back its *own* tasks, and task ownership alone is
-sufficient to create/run/view them (`stdweb.view_all_tasks`/
-`stdweb.edit_all_tasks` are for working with *other* users' tasks, not
-needed here).
+No other StdWeb permission is needed for *this service itself*: it only
+ever creates, uploads to, and reads back its *own* tasks, and task
+ownership alone is sufficient to create/run/view them.
+
+That ownership is also the catch for everyone else: a StdWeb task is
+private to whoever (or whatever bot) created it unless explicitly shared
+(confirmed: `Task.can_view()` denies anyone but the owner, StdWeb staff,
+or `stdweb.view_all_tasks`/`stdweb.edit_all_tasks` holders). Without
+`STDWEB_GROUP_ID` set, a real operator clicking the StdWeb task link
+posted in a rescan reply comment gets a 403, not the task page. Create a
+StdWeb Django Group for your operators (Django admin → Groups), add them
+to it, and set `STDWEB_GROUP_ID` in `.env` to that group's *name* (not a
+numeric id -- see `.env.default`).
 
 **API token**: `python manage.py drf_create_token <username>`, or via
 StdWeb's own UI if it exposes one. Use this as `STDWEB_TOKEN` in `.env`.
@@ -144,7 +152,7 @@ Copy `.env.default` and fill in the values from steps 1-2 and 4:
 | `OWNCLOUD_BASE_URL`, `OWNCLOUD_USERNAME`, `OWNCLOUD_TOKEN`, `OWNCLOUD_USER_ID` | Step 4 |
 | `SKYPORTAL_URL`, `SKYPORTAL_TOKEN` | Step 1 |
 | `STDWEB_URL`, `STDWEB_TOKEN` | Step 2 |
-| `GROUP_IDS` | Step 1 (group membership) |
+| `STDWEB_GROUP_ID` | Step 2 (StdWeb operator group) |
 | `TELESCOPE_INSTRUMENT_MAP` | See below |
 
 `TELESCOPE_INSTRUMENT_MAP` maps every OwnCloud telescope-folder name that
@@ -180,3 +188,7 @@ rescan" in `README.md` if you want that.
 4. Check the source's ledger (`GET /api/obj/{id}/analysis?analysisServiceID=<grandma_rescan id>`)
    shows the file as `processed` -- this exercises step 1's `Run Analyses`
    ACL and the Analysis Service registration together.
+5. If `STDWEB_GROUP_ID` is set, log into StdWeb as a real operator account
+   (a member of that group, not the bot) and open the StdWeb task link
+   from the reply comment in step 2 -- it should load, not 403. An
+   account that is *not* a member of that group should still get a 403.
