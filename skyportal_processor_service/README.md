@@ -1,4 +1,4 @@
-# Comment processor README
+# Comment processor
 
 An automatic monitoring service for SkyPortal comments that runs StdWeb forced
 photometry on new files found under a source's OwnCloud folder, and uploads
@@ -6,8 +6,12 @@ the result back to the SkyPortal source as a photometry point.
 
 ## Features
 
-* Polls SkyPortal for new comments (`comment_watcher.py`); any non-bot comment
-  on a source triggers a check, no special command required.
+* Polls SkyPortal for new comments (`comment_watcher.py`); any comment on
+  a source triggers a check, except this service's own bot replies (a
+  self-reply filter, not a blanket bot/non-bot one -- a different bot
+  account's comment still counts, see `get_new_comments`) and an explicit
+  `@rescanhelp`/`@rescandump` command, which reply directly instead of
+  triggering a check (see below).
 * Also runnable directly from SkyPortal's own "Run Analysis" UI/API, without
   posting a comment -- see "Triggering a rescan" below.
 * Recursively scans the source's OwnCloud folder for new FITS files, checking
@@ -40,14 +44,19 @@ ledger" and "Triggering a rescan" below) on an existing
 SkyPortal/StdWeb/OwnCloud deployment before pointing this service at it.
 Notably:
 
-* `TELESCOPE_INSTRUMENT_MAP` (required): JSON object mapping each OwnCloud
-  telescope folder name (the path segment right after the source folder,
-  e.g. `Candidates/Skyportal/<source>/<telescope>/file.fits`) to the exact
-  SkyPortal instrument name to attribute its photometry to. Every telescope
-  folder that can appear under `SAVE_PATH` must have an entry -- a file under
-  an unmapped telescope fails the upload step outright (with a link to the
-  StdWeb task so it can be uploaded manually) rather than silently attributing
-  it to a generic/default instrument. Look up exact instrument names via
+* `TELESCOPE_INSTRUMENT_MAP` (optional, defaults to empty): JSON object
+  mapping an OwnCloud telescope folder name (the path segment right after
+  the source folder, e.g.
+  `Candidates/Skyportal/<source>/<telescope>/file.fits`) to the exact
+  SkyPortal instrument name to attribute its photometry to -- only needed
+  when the two aren't byte-for-byte identical. A folder name that's
+  already identical to a real instrument name resolves automatically (see
+  `get_instrument_names`/`pipeline_tick`'s exact-match fallback in
+  `comment_watcher.py`), deliberately with no normalization/fuzzy matching
+  -- a telescope that's neither mapped here nor an exact instrument-name
+  match fails the upload step outright (with a link to the StdWeb task so
+  it can be uploaded manually) rather than silently attributing it to a
+  generic/default instrument. Look up exact instrument names via
   `GET /api/instrument` on your SkyPortal instance.
 * `STDWEB_TOKEN` needs to belong to a StdWeb user with the
   `stdweb.skyportal_upload` permission, and that StdWeb instance needs its own
@@ -74,9 +83,16 @@ created, and the service stays comment-triggered only, exactly as before.
 SkyPortal sends no authentication to this endpoint
 (`authentication_type: "none"`) -- anyone who can reach
 `WEBHOOK_LISTEN_HOST:WEBHOOK_LISTEN_PORT` can trigger a rescan of any real
-source. That's a nuisance, not a data-integrity risk (a rescan only ever acts
-on files already sitting in OwnCloud), but firewall the port to SkyPortal's
-own network in production rather than exposing it publicly.
+source. `WebhookHandler.do_POST` only ever trusts the request's
+`resource_id` as a lookup key, never any data in the body: `ra`/`dec` come
+from its own authenticated `GET /api/sources/{id}`, not the request's
+`inputs.obj` -- trusting the body there instead would let anyone who can
+reach the port run forced photometry at an attacker-chosen position and
+have it uploaded to SkyPortal under any real source's name. That leaves
+triggering extra, unwanted rescan work as the actual exposure, not a
+data-integrity risk (a rescan only ever acts on files already sitting in
+OwnCloud) -- but firewall the port to SkyPortal's own network in
+production rather than exposing it publicly.
 
 ## File ledger
 
@@ -85,7 +101,7 @@ been turned into a StdWeb task and, if successful, uploaded to SkyPortal) is
 stored as a SkyPortal [Analysis](https://skyportal.io/docs/analysis.html)
 entry against the `grandma_rescan` service (status `completed`), not in the
 comment thread -- plots/parameters/corner plots stay hidden (`show_*: false`)
--- see `restore_ledger`/`save_ledger`/`prune_ledger_entries` in
+-- see `restore_ledger`/`save_ledger` in
 `comment_watcher.py`. This is always written the same way regardless of which
 path (comment or the optional webhook trigger above) started the run:
 `grandma_rescan` stays `upload_only: true` permanently, since SkyPortal's
@@ -122,18 +138,3 @@ token that's an actual member of a relevant group but silently produces an
 unreadable, orphaned ledger entry for a token with none (comment polling and
 posting don't have this problem -- SkyPortal grants broader read access to
 public/discoverable groups there than to arbitrary rows like an Analysis).
-
-## Testing policy: OwnCloud is read-only, always
-
-`comment_watcher.py` never writes to OwnCloud (only `PROPFIND`/`GET`) -- it's
-strictly a consumer of files other tools put there. Tests follow the same
-rule, including against the disposable Docker sandbox in
-`docker-compose.yaml`: the fixture file is placed straight into OwnCloud's
-on-disk storage (CI does this via `docker cp`/`docker exec occ files:scan`;
-a standalone local run's `seed_owncloud_file()` does the equivalent by
-writing to the bind-mounted data directory directly) and indexed with
-`occ files:scan`, never a WebDAV `PUT`/`MKCOL`/`DELETE`. When testing
-manually against a real (non-Docker) OwnCloud instance, this means using
-files that already exist there -- never create or upload new ones for a
-test, since there is no "local storage" to write to directly on a remote
-instance.

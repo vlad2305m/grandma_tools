@@ -29,10 +29,24 @@ SKYPORTAL_HEADERS = {"Authorization": f"token {SKYPORTAL_TOKEN}"}
 # SKYPORTAL_TOKEN -- see post_comment's docstring for why that's required.
 SKYPORTAL_POSTER_TOKEN = os.getenv("SKYPORTAL_POSTER_TOKEN")
 SKYPORTAL_POSTER_HEADERS = {"Authorization": f"token {SKYPORTAL_POSTER_TOKEN}"}
+# A member of, and an outsider to, ci-restricted-group -- see "Create
+# SkyPortal group-visibility test fixtures" in the CI workflow and
+# assert_group_visibility below.
+SKYPORTAL_GROUP_MEMBER_TOKEN = os.getenv("SKYPORTAL_GROUP_MEMBER_TOKEN")
+SKYPORTAL_GROUP_MEMBER_HEADERS = {"Authorization": f"token {SKYPORTAL_GROUP_MEMBER_TOKEN}"}
+SKYPORTAL_OUTSIDER_TOKEN = os.getenv("SKYPORTAL_OUTSIDER_TOKEN")
+SKYPORTAL_OUTSIDER_HEADERS = {"Authorization": f"token {SKYPORTAL_OUTSIDER_TOKEN}"}
 
 STDWEB_URL = os.getenv("STDWEB_URL")
 STDWEB_TOKEN = os.getenv("STDWEB_TOKEN")
 STDWEB_HEADERS = {"Authorization": f"Token {STDWEB_TOKEN}"}
+# A member of, and an outsider to, STDWEB_GROUP_ID -- see "Create StdWeb
+# group-visibility test fixtures" in the CI workflow and
+# assert_group_visibility below.
+STDWEB_MEMBER_TOKEN = os.getenv("STDWEB_MEMBER_TOKEN")
+STDWEB_MEMBER_HEADERS = {"Authorization": f"Token {STDWEB_MEMBER_TOKEN}"}
+STDWEB_OUTSIDER_TOKEN = os.getenv("STDWEB_OUTSIDER_TOKEN")
+STDWEB_OUTSIDER_HEADERS = {"Authorization": f"Token {STDWEB_OUTSIDER_TOKEN}"}
 
 FIXTURE_PATH = os.path.join(os.path.dirname(__file__), "fixtures", "test_image.fits")
 # Real WCS header of the fixture file -- must match, or forced photometry looks
@@ -233,7 +247,7 @@ def wait_for_analysis_completion(source_id, service_id, after_id=0, timeout=240,
     """
     Poll for a new "completed"/"failure" ObjAnalysis entry. Webhook-triggered
     jobs (job.callback_url set in comment_watcher.py) don't post a reply
-    comment -- they report back via send_webhook_callback, which SkyPortal
+    comment -- they report back via _post_webhook_callback, which SkyPortal
     records as an entry here instead; this is that path's equivalent of
     wait_for_reply.
     """
@@ -269,6 +283,44 @@ def wait_for_task_state(task_id, states, timeout=240, interval=5):
     )
 
 
+def assert_group_visibility(source_id, stdweb_id):
+    """
+    GROUP_IDS/STDWEB_GROUP_ID (see comment_watcher.py's save_ledger/
+    stdweb_make_task) are supposed to actually restrict who can see a run's
+    results, not just tag them. Confirm both the SkyPortal ledger entry and
+    the StdWeb task are visible to a real member of the configured group
+    and invisible to a real outsider -- see "Create SkyPortal/StdWeb
+    group-visibility test fixtures" in the CI workflow for how those four
+    identities are set up. Untestable against SkyPortal's demo group 1
+    (the public Sitewide Group every user auto-joins): sharing with it
+    alone would prove nothing either way, hence the dedicated
+    ci-restricted-group/STDWEB_GROUP_ID fixtures instead.
+    """
+    service_id = get_service_id(RESCAN_SERVICE_NAME)
+
+    response = sp_request(
+        "GET", f"/api/obj/{source_id}/analysis",
+        headers=SKYPORTAL_GROUP_MEMBER_HEADERS,
+        params={"analysisServiceID": service_id},
+    )
+    response.raise_for_status()
+    assert response.json()["data"], f"Group member can't see {source_id}'s ledger entry"
+
+    response = sp_request(
+        "GET", f"/api/obj/{source_id}/analysis",
+        headers=SKYPORTAL_OUTSIDER_HEADERS,
+        params={"analysisServiceID": service_id},
+    )
+    response.raise_for_status()
+    assert not response.json()["data"], f"Outsider can see {source_id}'s ledger entry"
+
+    response = requests.get(f"{STDWEB_URL}/api/tasks/{stdweb_id}/", headers=STDWEB_MEMBER_HEADERS)
+    assert response.status_code == 200, f"Group member can't view StdWeb task {stdweb_id}"
+
+    response = requests.get(f"{STDWEB_URL}/api/tasks/{stdweb_id}/", headers=STDWEB_OUTSIDER_HEADERS)
+    assert response.status_code == 403, f"Outsider can view StdWeb task {stdweb_id}"
+
+
 def assert_file_processed(source_id):
     """
     Shared post-condition for both trigger paths below: exactly the fixture
@@ -294,6 +346,8 @@ def assert_file_processed(source_id):
     photometry = response.json()["data"]
     matching = [p for p in photometry if p.get("origin") == f"stdweb:{stdweb_id}"]
     assert matching, f"No SkyPortal photometry point with origin stdweb:{stdweb_id}"
+
+    assert_group_visibility(source_id, stdweb_id)
 
 
 def test_comment_triggers_rescan_and_photometry():
@@ -330,7 +384,7 @@ def test_analysis_triggers_rescan_and_photometry():
     Analysis" button/API (POST /api/obj/<source_id>/analysis/<id>) against
     the separate grandma_rescan_trigger Analysis Service runs the same
     pipeline as a comment, without posting one -- see
-    WebhookHandler/send_webhook_callback in comment_watcher.py. The actual
+    WebhookHandler/_post_webhook_callback in comment_watcher.py. The actual
     ledger (checked below via assert_file_processed) is still written to the
     main grandma_rescan service, same as a comment-triggered run -- see
     save_ledger. Needs WEBHOOK_URL configured (see

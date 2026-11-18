@@ -22,8 +22,16 @@ env:
 
   SAVE_PATH: "Candidates/Skyportal"
   STDWEB_SAVE_PATH: ""
+  # Shared only with ci-stdweb-member, not ci-stdweb-outsider -- see
+  # "Create StdWeb group-visibility test fixtures" below and
+  # test_integration_comment_watcher.py's assert_group_visibility.
+  # GROUP_IDS itself (the SkyPortal-side equivalent) isn't set here at
+  # all: it's produced dynamically by "Create SkyPortal group-visibility
+  # test fixtures" below, since it has to be a freshly-created group's
+  # id, not a fixed demo one -- group 1 is the public Sitewide Group
+  # every user auto-joins, so sharing with it alone would prove nothing.
+  STDWEB_GROUP_ID: "ci-stdweb-operators"
   POLL_INTERVAL: "10"
-  GROUP_IDS: "1,2,3"
   SOURCE_TAG: ""
   SKYPORTAL_COMMAND: "@rescan"
   # "TAROT Calern" is one of the fixed demo instruments make load_demo_data
@@ -166,15 +174,55 @@ jobs:
 
         echo "STDWEB_TOKEN=$STDWEB_TOKEN" >> $GITHUB_OUTPUT
 
-    - name: Create second SkyPortal user
-      id: create_poster_user
+    - name: Create StdWeb group-visibility test fixtures
+      id: create_stdweb_group_fixtures
       run: |
-        # comment_watcher.py's self-reply filter excludes its own
-        # SELF_USER_ID, not SkyPortal's bot flag (every token-authenticated
-        # request is bot=True regardless of token) -- triggering it needs a
-        # token belonging to a genuinely different user. Note: previously
-        # needed a real Playwright/debug-login browser session for this;
-        # plain POST /api/user + /api/internal/tokens replaces it.
+        # Confirms STDWEB_GROUP_ID (see comment_watcher.py's
+        # stdweb_make_task) actually restricts who can view a task, not
+        # just who it's nominally shared with -- see Task.can_view in
+        # stdweb/models.py. Two plain (non-staff) users: one a member of
+        # the group every rescan task gets shared with, one not.
+        echo "Creating StdWeb group-visibility users..."
+        docker exec stdweb-web python manage.py shell -c "
+        from django.contrib.auth import get_user_model
+        from django.contrib.auth.models import Group
+        User = get_user_model()
+        group, _ = Group.objects.get_or_create(name='${{ env.STDWEB_GROUP_ID }}')
+        if not User.objects.filter(username='ci-stdweb-member').exists():
+            u = User.objects.create_user('ci-stdweb-member', 'ci-stdweb-member@example.com', '${{ env.STDWEB_PASSWORD }}')
+            u.groups.add(group)
+        if not User.objects.filter(username='ci-stdweb-outsider').exists():
+            User.objects.create_user('ci-stdweb-outsider', 'ci-stdweb-outsider@example.com', '${{ env.STDWEB_PASSWORD }}')
+        "
+
+        echo "Creating StdWeb group-visibility API tokens..."
+        docker exec stdweb-web python manage.py drf_create_token ci-stdweb-member > member_token_output.txt
+        STDWEB_MEMBER_TOKEN=$(tail -1 member_token_output.txt | awk '{print $3}')
+        docker exec stdweb-web python manage.py drf_create_token ci-stdweb-outsider > outsider_token_output.txt
+        STDWEB_OUTSIDER_TOKEN=$(tail -1 outsider_token_output.txt | awk '{print $3}')
+
+        if [ -z "$STDWEB_MEMBER_TOKEN" ] || [ -z "$STDWEB_OUTSIDER_TOKEN" ]; then
+          echo "Failed to extract StdWeb group-visibility tokens"
+          cat member_token_output.txt outsider_token_output.txt
+          exit 1
+        fi
+
+        echo "STDWEB_MEMBER_TOKEN=$STDWEB_MEMBER_TOKEN" >> $GITHUB_OUTPUT
+        echo "STDWEB_OUTSIDER_TOKEN=$STDWEB_OUTSIDER_TOKEN" >> $GITHUB_OUTPUT
+
+    - name: Create SkyPortal test users and groups
+      id: create_skyportal_fixtures
+      run: |
+        # One step, one SKYPORTAL_TOKEN, one api_post helper -- every test
+        # identity this suite needs against the one running SkyPortal
+        # instance: ci-poster (a genuinely different user from
+        # comment_watcher.py's own SKYPORTAL_TOKEN -- see post_comment's
+        # docstring for why that's required), and ci-restricted-group's
+        # member/outsider pair (confirms GROUP_IDS, see
+        # comment_watcher.py's save_ledger, actually restricts who can see
+        # a ledger entry, not just who it's nominally shared with --
+        # demo group 1 is the public Sitewide Group every new user
+        # auto-joins, so sharing with it alone would prove nothing).
         SKYPORTAL_TOKEN="${{ steps.extract_skyportal_token.outputs.SKYPORTAL_TOKEN }}"
 
         # Retries + real status/body on failure. Note: a previous plain
@@ -198,20 +246,37 @@ jobs:
           exit 1
         }
 
-        # groupIDsAndAdmin left empty: SkyPortal now auto-adds every new
-        # user to the configured public group (Sitewide Group, id 1 in the
-        # demo data) via set_default_group_async -- passing [[1, true]]
-        # explicitly here double-inserts the same (group_id, user_id) row
-        # and 400s. Admin on group 1 was never actually needed; plain
-        # membership is enough for ci-poster to post a comment on a group-1
-        # source.
+        # groupIDsAndAdmin left empty on every user below: SkyPortal now
+        # auto-adds every new user to the configured public group
+        # (Sitewide Group, id 1 in the demo data) via
+        # set_default_group_async -- passing [[1, true]] explicitly here
+        # double-inserts the same (group_id, user_id) row and 400s. Admin
+        # on group 1 was never actually needed; plain membership is enough
+        # for ci-poster to post a comment on a group-1 source.
         api_post /api/user '{"username": "ci-poster", "groupIDsAndAdmin": []}'
         USER_ID=$(python3 -c "import json; print(json.load(open('/tmp/api_response.json'))['data']['id'])")
-
         api_post /api/internal/tokens "{\"user_id\": $USER_ID, \"acls\": [\"Comment\"], \"name\": \"ci-poster-token\"}"
         POSTER_TOKEN=$(python3 -c "import json; print(json.load(open('/tmp/api_response.json'))['data']['token_id'])")
-
         echo "SKYPORTAL_POSTER_TOKEN=$POSTER_TOKEN" >> $GITHUB_OUTPUT
+
+        api_post /api/groups '{"name": "ci-restricted-group"}'
+        RESTRICTED_GROUP_ID=$(python3 -c "import json; print(json.load(open('/tmp/api_response.json'))['data']['id'])")
+        echo "RESTRICTED_GROUP_ID=$RESTRICTED_GROUP_ID" >> $GITHUB_OUTPUT
+
+        api_post /api/user '{"username": "ci-group-member", "groupIDsAndAdmin": []}'
+        MEMBER_USER_ID=$(python3 -c "import json; print(json.load(open('/tmp/api_response.json'))['data']['id'])")
+        api_post "/api/groups/$RESTRICTED_GROUP_ID/users" "{\"userID\": $MEMBER_USER_ID}"
+        api_post /api/internal/tokens "{\"user_id\": $MEMBER_USER_ID, \"acls\": [], \"name\": \"ci-group-member-token\"}"
+        MEMBER_TOKEN=$(python3 -c "import json; print(json.load(open('/tmp/api_response.json'))['data']['token_id'])")
+        echo "SKYPORTAL_GROUP_MEMBER_TOKEN=$MEMBER_TOKEN" >> $GITHUB_OUTPUT
+
+        # Never added to ci-restricted-group -- only its auto-joined
+        # Sitewide Group membership, same as ci-poster above.
+        api_post /api/user '{"username": "ci-outsider", "groupIDsAndAdmin": []}'
+        OUTSIDER_USER_ID=$(python3 -c "import json; print(json.load(open('/tmp/api_response.json'))['data']['id'])")
+        api_post /api/internal/tokens "{\"user_id\": $OUTSIDER_USER_ID, \"acls\": [], \"name\": \"ci-outsider-token\"}"
+        OUTSIDER_TOKEN=$(python3 -c "import json; print(json.load(open('/tmp/api_response.json'))['data']['token_id'])")
+        echo "SKYPORTAL_OUTSIDER_TOKEN=$OUTSIDER_TOKEN" >> $GITHUB_OUTPUT
 
     - name: Create test environment file
       run: |
@@ -228,17 +293,22 @@ jobs:
         # SkyPortal Configuration
         SKYPORTAL_URL=http://localhost:9000
         SKYPORTAL_TOKEN=${{ steps.extract_skyportal_token.outputs.SKYPORTAL_TOKEN }}
-        SKYPORTAL_POSTER_TOKEN=${{ steps.create_poster_user.outputs.SKYPORTAL_POSTER_TOKEN }}
+        SKYPORTAL_POSTER_TOKEN=${{ steps.create_skyportal_fixtures.outputs.SKYPORTAL_POSTER_TOKEN }}
+        SKYPORTAL_GROUP_MEMBER_TOKEN=${{ steps.create_skyportal_fixtures.outputs.SKYPORTAL_GROUP_MEMBER_TOKEN }}
+        SKYPORTAL_OUTSIDER_TOKEN=${{ steps.create_skyportal_fixtures.outputs.SKYPORTAL_OUTSIDER_TOKEN }}
 
         # StdWeb Configuration
         STDWEB_URL=http://localhost:8000
         STDWEB_TOKEN=${{ steps.extract_stdweb_token.outputs.STDWEB_TOKEN }}
+        STDWEB_MEMBER_TOKEN=${{ steps.create_stdweb_group_fixtures.outputs.STDWEB_MEMBER_TOKEN }}
+        STDWEB_OUTSIDER_TOKEN=${{ steps.create_stdweb_group_fixtures.outputs.STDWEB_OUTSIDER_TOKEN }}
 
         # Application Settings
         SAVE_PATH=${{ env.SAVE_PATH }}
         STDWEB_SAVE_PATH=${{ env.STDWEB_SAVE_PATH }}
+        STDWEB_GROUP_ID=${{ env.STDWEB_GROUP_ID }}
         POLL_INTERVAL=${{ env.POLL_INTERVAL }}
-        GROUP_IDS=${{ env.GROUP_IDS }}
+        GROUP_IDS=${{ steps.create_skyportal_fixtures.outputs.RESTRICTED_GROUP_ID }}
         SOURCE_TAG=${{ env.SOURCE_TAG }}
         SKYPORTAL_COMMAND=${{ env.SKYPORTAL_COMMAND }}
         START_TIME=${{ env.START_TIME }}
