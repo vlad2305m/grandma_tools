@@ -948,7 +948,7 @@ def pipeline_tick(job: RescanJob) -> bool:
         new_done = sum(1 for f in job.file_jobs if f.stage == 1000)
         new_failed = sum(1 for f in job.file_jobs if f.stage == 1001)
         rescan_mentioned = SKYPORTAL_COMMAND in job.comment
-        if rescan_mentioned:
+        if not job.callback_url and (new_done or new_failed or rescan_mentioned):
             summary = (
                 f"Rescan complete: {new_done} new file(s) processed and uploaded to SkyPortal, {new_failed} new file(s) failed. "
                 f"Total: {len(job.processed_files)} processed, {len(job.failed_files)} failed."
