@@ -24,9 +24,6 @@ logger.setLevel(logging.INFO)
 # TODO
 # verify radec of Skyportal source is the one we need
 # uploading files takes time -> maybe put into separate thread
-# put group id everywhere
-# docker-compose
-# tests
 
 header = {}
 seen_comments: Dict[str, Set[str]] = dict()  # Track seen comments (by source + created at) to avoid duplication
@@ -805,19 +802,7 @@ def pipeline_tick(job: RescanJob) -> bool:
     """
     Main function that runs for all jobs. Broken up into pieces to allow waiting for something to happen asynchronously (and continuing from checkpoints even after restarting python).
 
-    Every comment on a source triggers a job stub, but job.comment/job.author
-    are already resolved by get_new_comments/_handle_comment at scheduling
-    time -- an explicit SKYPORTAL_COMMAND (help/dump/unrecognized) is
-    handled there too, synchronously, and never becomes a job at all. Every
-    job pipeline_tick actually sees is a genuine rescan (comment- or
-    webhook-triggered). The flow below -- restoring the files, listing
-    OwnCloud, creating tasks -- is silent unless it finds something worth
-    reporting: new files processed, a failure, or the triggering comment
-    itself explicitly contains SKYPORTAL_COMMAND (e.g. "@rescan") -- so a
-    human who deliberately asked for a rescan always gets confirmation,
-    even when there was nothing new to do, while an incidental comment
-    that happens to trigger one too (any comment does) stays silent
-    unless something actually happened.
+    See get_new_comments/_handle_comment for how the coments are handled.
 
     Flow (labelled by job.stage):
     1. Restore the processed/failed file ledger (see restore_ledger -- a
@@ -843,10 +828,6 @@ def pipeline_tick(job: RescanJob) -> bool:
             job.processed_files, job.failed_files, job.file_details = restore_ledger(job.source_id)
             job.stage = 2
 
-            # owncloud_ls already returns ([], []) for a missing folder --
-            # no separate existence check needed (that was a second,
-            # redundant PROPFIND every tick). Expected/common since every
-            # comment triggers a rescan, not just deliberate ones.
             _, files_short = owncloud_ls(job.source_id, depth=OWNCLOUD_SCAN_DEPTH)
             fits_files = [job.source_id + f for f in files_short if f.endswith(".fits") or f.endswith(".fit")]
             known = set(job.processed_files) | set(job.failed_files)
@@ -960,9 +941,7 @@ def pipeline_tick(job: RescanJob) -> bool:
                     try:
                         comment_back(job, "; ".join(parts) + ".")
                     except Exception:
-                        # Best-effort only -- the ledger save above already
-                        # succeeded, so no state is lost if this particular
-                        # notification comment doesn't make it.
+                        # Best-effort only
                         traceback.print_exc()
                         logger.error(f"Could not post progress comment for job #{job.job_id} ({job.source_id})")
 
@@ -974,7 +953,6 @@ def pipeline_tick(job: RescanJob) -> bool:
         job.stage = 1001
         traceback.print_exc()
         logger.error(f"Error while processing job #{job.job_id} for source {job.source_id}")
-        # Hopefully this will not error
         comment_back(job, str(e))
     else:
         new_done = sum(1 for f in job.file_jobs if f.stage == 1000)

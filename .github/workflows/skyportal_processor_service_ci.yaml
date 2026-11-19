@@ -6,42 +6,23 @@ on:
   pull_request:
 
 env:
-  # comment_watcher.py appends /remote.php/dav/files/{user}/{path} itself
-  # (see its own default BASE_URL fallback, which is also bare) -- a
-  # pre-suffixed value here doubles the path and 404s every OwnCloud
-  # PROPFIND/GET it makes.
   OWNCLOUD_BASE_URL: "http://localhost:8080"
   OWNCLOUD_USERNAME: "admin"
   OWNCLOUD_TOKEN: "admin"
   OWNCLOUD_USER_ID: "admin"
-  # Only used by the test's standalone-run fallback now (the "Seed OwnCloud
-  # fixture file" step below places the fixture itself, via `docker cp`
-  # into the container, not this host path) -- kept for parity with
-  # test_integration_comment_watcher.py's own default.
   OWNCLOUD_DATA_PATH: "../data/owncloud"
 
   SAVE_PATH: "Candidates/Skyportal"
   STDWEB_SAVE_PATH: ""
-  # Shared only with ci-stdweb-member, not ci-stdweb-outsider -- see
-  # "Create StdWeb group-visibility test fixtures" below and
-  # test_integration_comment_watcher.py's assert_group_visibility.
-  # GROUP_IDS itself (the SkyPortal-side equivalent) isn't set here at
-  # all: it's produced dynamically by "Create SkyPortal group-visibility
-  # test fixtures" below, since it has to be a freshly-created group's
-  # id, not a fixed demo one -- group 1 is the public Sitewide Group
-  # every user auto-joins, so sharing with it alone would prove nothing.
+  # Group shared only with ci-stdweb-member, not ci-stdweb-outsider,
+  # for visibility tests.
   STDWEB_GROUP_ID: "ci-stdweb-operators"
   POLL_INTERVAL: "10"
   SOURCE_TAG: ""
   SKYPORTAL_COMMAND: "@rescan"
-  # "TAROT Calern" is one of the fixed demo instruments make load_demo_data
-  # seeds every time -- matches the TAROT-TCA folder the integration test
-  # uploads its fixture FITS under.
   TELESCOPE_INSTRUMENT_MAP: '{"TAROT-TCA": "TAROT Calern"}'
   START_TIME: "2017-06-01T00:00:00Z"
 
-  # Checked out (upstream, not a fork -- see the "Checkout StdWeb" step) and
-  # built alongside grandma_tools.
   STDWEB_USERNAME: "stdweb-ci"
   STDWEB_PASSWORD: "stdweb-ci-password-not-used-in-prod"
 
