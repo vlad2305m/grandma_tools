@@ -18,7 +18,6 @@ env:
   # for visibility tests.
   STDWEB_GROUP_ID: "ci-stdweb-operators"
   POLL_INTERVAL: "10"
-  SOURCE_TAG: ""
   SKYPORTAL_COMMAND: "@rescan"
   TELESCOPE_INSTRUMENT_MAP: '{"TAROT-TCA": "TAROT Calern"}'
   START_TIME: "2017-06-01T00:00:00Z"
@@ -306,7 +305,6 @@ jobs:
         STDWEB_GROUP_ID=${{ env.STDWEB_GROUP_ID }}
         POLL_INTERVAL=${{ env.POLL_INTERVAL }}
         GROUP_IDS=${{ steps.create_skyportal_fixtures.outputs.RESTRICTED_GROUP_ID }}
-        SOURCE_TAG=${{ env.SOURCE_TAG }}
         SKYPORTAL_COMMAND=${{ env.SKYPORTAL_COMMAND }}
         START_TIME=${{ env.START_TIME }}
         # Activates the "Run Analysis" webhook trigger path (see

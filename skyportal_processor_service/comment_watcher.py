@@ -10,7 +10,7 @@ import traceback
 from typing import Dict, List, Optional, Set, Tuple
 import json
 import re
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import requests
 from config import get_required_env, load_env_file
@@ -495,14 +495,7 @@ def _handle_comment(source: dict, comment: dict) -> None:
     deferred to pending_rerun if a job for this source is already active
     (see _schedule_pending_rerun).
 
-    Mutates `pipeline`/`pending_rerun` directly rather than returning
-    something for the caller to schedule, so get_new_comments doesn't need
-    a separate coalescing pass to keep only the latest comment per source:
-    each comment is handled as it's seen, checking `pipeline`'s current
-    state (including anything scheduled earlier in the same tick). Worst
-    case, two comments for the same source in one tick schedule a job *and*
-    a pending rerun -- benign, the pending one just waits its turn, same as
-    any other pending_rerun.
+    Mutates `pipeline`/`pending_rerun` directly.
     """
     has_command = SKYPORTAL_COMMAND in comment["text"]
     if REQUIRE_COMMAND and not has_command:
@@ -645,6 +638,8 @@ def owncloud_ls(path: str, depth: int = 1) -> Tuple[List[str], List[str]]:
 
     Depth indicates whether to also list contents of subfolders: 1 is just the requested folder, 2 is including its subfolder, etc.
 
+    Returns ([], []) when the directory is empty or doesn't exist.
+
     Returns a list of full paths and a list of relative paths
     """
     check_url = f"{BASE_URL}/remote.php/dav/files/{OWNCLOUD_USER_ID}/{SAVE_PATH}/{path}"
@@ -653,8 +648,9 @@ def owncloud_ls(path: str, depth: int = 1) -> Tuple[List[str], List[str]]:
         timeout=REQUEST_TIMEOUT,
     )
 
-    if response.status_code != 207:
+    if response.status_code == 404:
         return [], []
+    response.raise_for_status()
     
     result = []
     result_short = []
@@ -663,7 +659,7 @@ def owncloud_ls(path: str, depth: int = 1) -> Tuple[List[str], List[str]]:
         i2 = response.text.find("</d:href>", i1)
         if i2 == -1:
             return result, result_short
-        file = response.text[i1+len("<d:href>"):i2]
+        file = unquote(response.text[i1+len("<d:href>"):i2])
         result.append(file)
         result_short.append(file[len(check_url)-len(BASE_URL):])
         i1 = response.text.find("<d:href>", i2)
@@ -681,16 +677,7 @@ def stdweb_make_task(source_id: str, job_id: int, file_path: str, local_file: Op
     Otherwise the caller must still populate the task via
     transfer_file_owncloud_to_stdweb.
 
-    Shared with STDWEB_GROUP_ID (a StdWeb Django Group *name*, not a
-    numeric id -- StdWeb's own task-sharing field is name-keyed
-    (api/serializers.py's TaskSerializer.groups is a SlugRelatedField on
-    'name'), and StdWeb exposes no API to resolve a numeric group id to
-    one) if configured, so a real operator with that StdWeb group can
-    actually view the task via the link posted in rescan replies (see
-    describe_file_result) -- without this, every task is owned solely by
-    STDWEB_TOKEN's bot account and Task.can_view() denies everyone else
-    (confirmed: StdWeb staff/view_all_tasks holders are the only
-    exception). Unset by default: tasks stay bot-only, exactly as before.
+    Shared with STDWEB_GROUP_ID.
 
     Returns task id of the new task.
     """
@@ -745,8 +732,11 @@ def stdweb_upload_photometry(stdweb_id: int, source_id: str, instrument_name: st
     """
     Ask StdWeb to push this task's forced-photometry result to a SkyPortal source
     (StdWeb does the actual SkyPortal PUT itself, using its own SkyPortal token --
-    see stdweb/api/views.py:task_skyportal_upload). Raises RuntimeError with the
-    server's error detail on failure.
+    see stdweb/api/views.py:task_skyportal_upload). Raises requests.exceptions.
+    HTTPError (response attached) with the server's error detail on failure --
+    not a plain RuntimeError, so _is_transient can still recognize a 5xx here
+    and retry it (see pipeline_tick's stage-7 caller) instead of permanently
+    blacklisting the file over what might be a momentary StdWeb hiccup.
     """
     response = requests.request(
         "POST", f"{STDWEB_URL}/api/tasks/{stdweb_id}/skyportal/",
@@ -759,7 +749,7 @@ def stdweb_upload_photometry(stdweb_id: int, source_id: str, instrument_name: st
             detail = response.json().get("error", response.text)
         except ValueError:
             detail = response.text
-        raise RuntimeError(f"StdWeb error {response.status_code}: {detail}")
+        raise requests.exceptions.HTTPError(f"StdWeb error {response.status_code}: {detail}", response=response)
 
 def transfer_file_owncloud_to_stdweb(owncloud_path: str, stdweb_task_id: int, stdweb_filename: Optional[str] = None) -> None:
     download_url = f"{BASE_URL}/remote.php/dav/files/{OWNCLOUD_USER_ID}/{SAVE_PATH}/{owncloud_path}"
@@ -958,7 +948,7 @@ def pipeline_tick(job: RescanJob) -> bool:
         new_done = sum(1 for f in job.file_jobs if f.stage == 1000)
         new_failed = sum(1 for f in job.file_jobs if f.stage == 1001)
         rescan_mentioned = SKYPORTAL_COMMAND in job.comment
-        if new_done or new_failed or rescan_mentioned:
+        if rescan_mentioned:
             summary = (
                 f"Rescan complete: {new_done} new file(s) processed and uploaded to SkyPortal, {new_failed} new file(s) failed. "
                 f"Total: {len(job.processed_files)} processed, {len(job.failed_files)} failed."
@@ -1238,7 +1228,6 @@ if __name__ == "__main__":
         # only to STDWEB_TOKEN's own bot account (and StdWeb staff/
         # view_all_tasks holders), exactly as before this setting existed.
         STDWEB_GROUP_ID = os.getenv("STDWEB_GROUP_ID", "")
-        SOURCE_TAG = os.getenv("SOURCE_TAG", "")
         POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
         SKYPORTAL_GROUP_IDS_FILTER = [
             int(x.strip()) for x in os.getenv("GROUP_IDS", "").split(",") if x.strip()

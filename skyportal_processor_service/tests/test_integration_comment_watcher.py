@@ -22,6 +22,13 @@ OWNCLOUD_DATA_PATH = os.getenv("OWNCLOUD_DATA_PATH", "../data/owncloud")
 OWNCLOUD_USER_ID = os.getenv("OWNCLOUD_USER_ID")
 SAVE_PATH = os.getenv("SAVE_PATH")
 
+# Applied as sp_request's default below, and explicitly on the few direct
+# requests.get calls (StdWeb) that don't go through it -- without this, a
+# stalled connection blocks inside a single call forever, silently bypassing
+# wait_for_reply/wait_for_task_state/wait_for_analysis_completion's own
+# deadlines (which only bound time between polls, not a single request).
+REQUEST_TIMEOUT = 30
+
 SKYPORTAL_URL = os.getenv("SKYPORTAL_URL")
 SKYPORTAL_TOKEN = os.getenv("SKYPORTAL_TOKEN")
 SKYPORTAL_HEADERS = {"Authorization": f"token {SKYPORTAL_TOKEN}"}
@@ -85,6 +92,7 @@ def sp_request(method, path, **kwargs):
     response.raise_for_status() themselves for any other error.
     """
     url = f"{SKYPORTAL_URL}{path}"
+    kwargs.setdefault("timeout", REQUEST_TIMEOUT)
     response = requests.request(method, url, **kwargs)
     attempt = 0
     while response.status_code == 429 and attempt < 5:
@@ -271,7 +279,7 @@ def wait_for_task_state(task_id, states, timeout=240, interval=5):
     last_state = None
     while time.time() < deadline:
         response = requests.get(
-            f"{STDWEB_URL}/api/tasks/{task_id}/", headers=STDWEB_HEADERS
+            f"{STDWEB_URL}/api/tasks/{task_id}/", headers=STDWEB_HEADERS, timeout=REQUEST_TIMEOUT,
         )
         response.raise_for_status()
         last_state = response.json()["state"]
@@ -314,10 +322,10 @@ def assert_group_visibility(source_id, stdweb_id):
     response.raise_for_status()
     assert not response.json()["data"], f"Outsider can see {source_id}'s ledger entry"
 
-    response = requests.get(f"{STDWEB_URL}/api/tasks/{stdweb_id}/", headers=STDWEB_MEMBER_HEADERS)
+    response = requests.get(f"{STDWEB_URL}/api/tasks/{stdweb_id}/", headers=STDWEB_MEMBER_HEADERS, timeout=REQUEST_TIMEOUT)
     assert response.status_code == 200, f"Group member can't view StdWeb task {stdweb_id}"
 
-    response = requests.get(f"{STDWEB_URL}/api/tasks/{stdweb_id}/", headers=STDWEB_OUTSIDER_HEADERS)
+    response = requests.get(f"{STDWEB_URL}/api/tasks/{stdweb_id}/", headers=STDWEB_OUTSIDER_HEADERS, timeout=REQUEST_TIMEOUT)
     assert response.status_code == 403, f"Outsider can view StdWeb task {stdweb_id}"
 
 

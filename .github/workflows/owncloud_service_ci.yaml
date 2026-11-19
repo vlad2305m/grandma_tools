@@ -112,7 +112,7 @@ jobs:
     - name: Install python dependencies
       run: |
         cd owncloud_service
-        echo "Installing source watcher dependencies.
+        echo "Installing source watcher dependencies."
         pip install --break-system-packages -r requirements.txt
         
     - name: Test source watcher startup
